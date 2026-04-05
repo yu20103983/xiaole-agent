@@ -1,5 +1,6 @@
-"""
-小乐语音助手 - 全局配置
+"""全局配置
+
+所有可调参数集中在此文件，按需修改。
 """
 
 # ============ 音频设备 ============
@@ -13,12 +14,12 @@ DUPLEX_MODE = None        # 全双工模式: True/False/None(自动检测)
 PREFER_LOCAL = False      # 优先本地设备（跳过蓝牙检测）
 
 # ============ TTS ============
-TTS_VOICE = "xiaoxiao"    # TTS 语音：xiaoxiao/yunxi/xiaoyi/yunjian
-TTS_RATE = "+10%"         # TTS 语速
+TTS_VOICE = "matcha-zh-baker"  # TTS 模型：matcha-zh-baker / melo-zh
+TTS_SPEED = 1.0               # TTS 语速 (1.0=正常, >1加速, <1减速)
 
 # ============ 播放管线 ============
 MAX_MERGE_CLAUSES = 2     # 最多合并逗号短句数（提升语气连贯性）
-INPUT_SILENCE_TIMEOUT = 5.0  # 静音超时后发送指令（秒）
+INPUT_SILENCE_TIMEOUT = 4.0  # 静音超时后发送指令（秒）
 CONTINUOUS_INPUT_SILENCE_TIMEOUT = 3.0  # 连续对话模式下的静音超时（秒）
 
 # ============ 会话 ============

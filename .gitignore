@@ -1,20 +1,20 @@
-# Byte-compiled
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+dist/
+build/
 
-# Node
+# Node.js
 node_modules/
 package-lock.json
 
-# Models (too large for git)
+# Models (too large for git, download via download_models.bat)
 models/
 
-# Binary tools
-bin/
-
-# Cache
+# TTS cache (auto-generated)
 cache/
 
 # Audio files
@@ -34,15 +34,16 @@ venv/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Pi Agent runtime data
-.pi/skills/music_cache/
+# Pi Agent runtime
+.pi/
 
-# Temp
+# Temp / Logs
 *.tmp
 *.log

@@ -1,7 +1,6 @@
-"""
-小乐语音助手 - 主程序
+"""主程序
 
-功能:语音唯醒、指令识别、Agent 交互、流式 TTS 播报、语音打断
+语音唤醒 → ASR 识别 → 会话状态机 → Agent 交互 → 流式 TTS 播报 → 语音打断
 """
 import sys, os, time, signal, threading, re, queue
 import numpy as np
@@ -132,8 +131,8 @@ def clean_for_speech(text):
 
 
 def resample_to_a2dp(audio_float32):
-    """24kHz float32 → A2DP采样率 float32"""
-    return fast_resample(audio_float32, 24000, A2DP_SR)
+    """TTS采样率 float32 → A2DP采样率 float32"""
+    return fast_resample(audio_float32, tts.sample_rate, A2DP_SR)
 
 
 def play_audio(audio_float32, first=False):
@@ -146,7 +145,7 @@ def play_audio(audio_float32, first=False):
 
 # ============ 全局组件 ============
 asr = ASREngine()
-tts = TTSEngine(voice=TTS_VOICE, rate=TTS_RATE)
+tts = TTSEngine(voice=TTS_VOICE, speed=TTS_SPEED)
 pi = PiClient(working_dir=PI_WORKING_DIR, provider=PI_PROVIDER, model=PI_MODEL)
 session = SessionController()
 recorder = AudioRecorder(device_id=HFP_IN, sample_rate=HFP_IN_SR, target_sr=16000,
@@ -191,10 +190,10 @@ def speak_async(text, then_state=None):
 
 
 # ============ 打断监听 ============
-STOP_CHARS = set('停听挺庭叮顶定丁町亭铤廷婷')
+STOP_CHARS = set('终中钟忠衷肿种众重')
 
 def start_interrupt_listen(stop_event):
-    """开始监听打断(非阻塞),检测到'停'音时设置stop_event"""
+    """开始监听打断(非阻塞),检测到'终'音时设置stop_event"""
     def _on_final(text):
         print(f"\n  [监听] {text}", flush=True)
         if any(c in text for c in STOP_CHARS) or 'stop' in text.lower():
@@ -387,7 +386,7 @@ def handle_command(cmd):
 
     while True:
         if stop_event.is_set():
-            print("\n[打断] 用户说停止", flush=True)
+            print("\n[打断] 用户说终止", flush=True)
             if listening:
                 stop_interrupt_listen()
                 listening = False
@@ -398,7 +397,7 @@ def handle_command(cmd):
                 try: sentence_queue.get_nowait()
                 except: break
             time.sleep(1)
-            play_simple("好的,已停止")
+            play_simple("好的,已终止")
             break
 
         with clauses_lock:
@@ -590,7 +589,7 @@ def main():
     print("  '小乐小乐' 唤醒 | '小乐小乐退下' 休眠")
     print("  '小乐,xxx' 发送指令(等静音后发送)")
     print("  '小乐,长段输入' → 说完后说'好了'")
-    print("  播放中说 '停止' 打断")
+    print("  播放中说 '终止' 打断")
     print("  连续对话: agent自动开启/关闭")
     print("  Ctrl+C 退出")
     print("=" * 50, flush=True)

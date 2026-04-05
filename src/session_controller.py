@@ -17,10 +17,10 @@ from config import AUTO_SLEEP_TIMEOUT, CONTINUOUS_SILENCE_TIMEOUT
 
 
 class SessionState(Enum):
-    SLEEPING = "sleeping"   # 休眠：只监听唤醒词
-    ACTIVE = "active"       # 活跃：监听指令
-    PROCESSING = "processing"  # 处理中：等待 Pi 响应
-    SPEAKING = "speaking"   # 播报中：TTS 输出
+    SLEEPING = "sleeping"   # 休眠:只监听唤醒词
+    ACTIVE = "active"       # 活跃:监听指令
+    PROCESSING = "processing"  # 处理中:等待 Pi 响应
+    SPEAKING = "speaking"   # 播报中:TTS 输出
 
 
 # 连续对话模式标记词
@@ -56,6 +56,11 @@ _TUIXIA = _TUI_CHARS + r".{0,1}" + _XIA_CHARS
 # "再见" 的变体
 _ZAIJIAN = r"再.{0,1}见"
 
+# 标点字符类 (含全角半角)
+_PUNCT = r'[，,：:；;。.、\s]'
+_PUNCT_PLUS = _PUNCT + r'+'
+_PUNCT_STAR = _PUNCT + r'*'
+
 # 等待后续指令的超时秒数(用户说"小乐"后的等待窗口)
 _PENDING_TIMEOUT = 5.0
 
@@ -73,26 +78,26 @@ def _has_xiaole(text: str) -> bool:
 def _is_only_xiaole(text: str) -> bool:
     """检测文本是否只包含'小乐'(1~2次),没有其他有意义的内容"""
     cleaned = re.sub(_ONE_XL, '', text)
-    cleaned = re.sub(r'[,,::。.、\s!!??]', '', cleaned)
+    cleaned = re.sub(r'[，,：:；;。.、\s!！?？]', '', cleaned)
     return len(cleaned) == 0
 
 
 def _strip_xiaole_prefix(text: str) -> str:
     """去掉文本开头的 '小乐' 前缀(含标点分隔),返回指令部分"""
     # 先尝试去掉 "小乐小乐" 前缀
-    m = re.match(_TWO_XL + r"[,,::。.、\s]*", text)
+    m = re.match(_TWO_XL + _PUNCT_STAR, text)
     if m:
         return text[m.end():].strip()
     # 再尝试去掉单个 "小乐" 前缀
-    m = re.match(_ONE_XL + r"[,,::。.、\s]*", text)
+    m = re.match(_ONE_XL + _PUNCT_STAR, text)
     if m:
         return text[m.end():].strip()
     # 尝试去掉 "X乐X乐" 前缀
-    m = re.match(_ANY_LE_TWICE + r"[,,::。.、\s]*", text)
+    m = re.match(_ANY_LE_TWICE + _PUNCT_STAR, text)
     if m:
         return text[m.end():].strip()
     # 尝试去掉开头的单独 "乐" (被截断的前缀)
-    m = re.match(_LE_CHARS + r"[,,::。.、\s]*", text)
+    m = re.match(_LE_CHARS + _PUNCT_STAR, text)
     if m:
         return text[m.end():].strip()
     return ""
@@ -124,10 +129,10 @@ class SessionController:
         self._lock = threading.Lock()
         self._last_activity = time.time()
         self._auto_sleep_timeout = AUTO_SLEEP_TIMEOUT
-        # 上下文关联：用户说了“小乐”但没跟指令，等待下一句
+        # 上下文关联:用户说了"小乐"但没跟指令,等待下一句
         self._pending_command = False
         self._pending_time = 0.0
-        # 排队指令：agent处理中时用户说的新指令
+        # 排队指令:agent处理中时用户说的新指令
         self._queued_command: Optional[str] = None
         # 连续对话模式
         self.continuous_mode = False
@@ -189,15 +194,15 @@ class SessionController:
                     self._on_wake()
 
     def _handle_active(self, text: str):
-        """活跃状态：检测休眠词或提取指令
-        支持上下文关联：
-          - “小乐”(停顿)“帮我放歌” → 第一句设置pending，第二句作为指令
-          - “小乐，帮我放歌” → 直接提取指令
-        连续对话模式下，所有语音直接作为指令（依然支持休眠词）
+        """活跃状态:检测休眠词或提取指令
+        支持上下文关联:
+          - "小乐"(停顿)"帮我放歌" → 第一句设置pending,第二句作为指令
+          - "小乐,帮我放歌" → 直接提取指令
+        连续对话模式下,所有语音直接作为指令(依然支持休眠词)
         """
         self._last_activity = time.time()
 
-        # 1. 检查休眠词（连续对话模式下也生效）
+        # 1. 检查休眠词(连续对话模式下也生效)
         if _is_sleep_command(text):
             self._pending_command = False
             if self.continuous_mode:
@@ -227,10 +232,10 @@ class SessionController:
             return
 
         # 4. 以"乐"开头(ASR截断了"小")→ 尝试剥离"乐"前缀提取指令
-        le_prefix = re.match(_LE_CHARS + r"[,,::。.、\s]*", text)
+        le_prefix = re.match(_LE_CHARS + _PUNCT_STAR, text)
         if le_prefix:
             cmd = text[le_prefix.end():].strip()
-            cmd = re.sub(r'[。..!!??]+$', '', cmd).strip()
+            cmd = re.sub(r'[。．.!！?？]+$', '', cmd).strip()
             if cmd and len(cmd) > 1:
                 self._pending_command = False
                 self._transition(SessionState.PROCESSING)
@@ -250,8 +255,8 @@ class SessionController:
             elapsed = time.time() - self._pending_time
             if elapsed <= _PENDING_TIMEOUT:
                 # 去掉可能的前缀标点
-                cmd = re.sub(r'^[,,::。.、\s]+', '', text)
-                cmd = re.sub(r'[。..!!??]+$', '', cmd).strip()
+                cmd = re.sub(r'^[，,：:；;。.、\s]+', '', text)
+                cmd = re.sub(r'[。．.!！?？]+$', '', cmd).strip()
                 if cmd and len(cmd) > 1:
                     self._pending_command = False
                     self._transition(SessionState.PROCESSING)
@@ -264,9 +269,9 @@ class SessionController:
                 self._pending_command = False
                 print(f"[Session] 等待超时,忽略 ({text})")
 
-        # 5b. 连续对话模式：任何语音直接作为指令
+        # 5b. 连续对话模式:任何语音直接作为指令
         if self.continuous_mode:
-            cmd = re.sub(r'^[,，:：。.、\s]+', '', text)
+            cmd = re.sub(r'^[，,：:；;。.、\s]+', '', text)
             cmd = re.sub(r'[。．.!！?？]+$', '', cmd).strip()
             if cmd and len(cmd) > 1:
                 self._continuous_last_activity = time.time()
@@ -277,7 +282,7 @@ class SessionController:
                     self._on_command(cmd)
                 return
 
-        # 6. 不含“小乐”且非pending → 忽略（环境噪音）
+        # 6. 不含"小乐"且非pending → 忽略(环境噪音)
 
     def _handle_processing(self, text: str):
         """处理中状态:缓存用户新指令,等agent完成后执行"""
@@ -298,10 +303,10 @@ class SessionController:
             return
 
         # "乐"前缀截断
-        le_prefix = re.match(_LE_CHARS + r"[,,::。.\s]*", text)
+        le_prefix = re.match(_LE_CHARS + _PUNCT_STAR, text)
         if le_prefix:
             cmd = text[le_prefix.end():].strip()
-            cmd = re.sub(r'[。..\uff01!??]+$', '', cmd).strip()
+            cmd = re.sub(r'[。．.!！?？]+$', '', cmd).strip()
             if cmd and len(cmd) > 1:
                 self._queued_command = cmd
                 print(f"[Session] ▇ 排队指令(乐前缀,等待agent完成): {cmd}")
@@ -329,7 +334,9 @@ class SessionController:
         cmd = _strip_xiaole_prefix(text)
 
         # 去掉末尾句号等
-        cmd = re.sub(r'[。..!!??]+$', '', cmd).strip()
+        # 去掉末尾句号和前导标点
+        cmd = re.sub(r'[。．.!！?？]+$', '', cmd).strip()
+        cmd = re.sub(r'^[，,：:；;。.、\s]+', '', cmd).strip()
 
         if not cmd or len(cmd) <= 1:
             return None
@@ -373,7 +380,7 @@ class SessionController:
                 self._on_continuous_end()
 
     def refresh_continuous_activity(self):
-        """刷新连续对话模式的活动时间（agent回复完成时调用）"""
+        """刷新连续对话模式的活动时间(agent回复完成时调用)"""
         self._continuous_last_activity = time.time()
 
     def check_continuous_timeout(self):

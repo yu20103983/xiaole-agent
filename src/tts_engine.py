@@ -1,80 +1,131 @@
 """
-TTS 引擎 — edge-tts 文本转语音 + 音频解码 + 磁盘缓存
+TTS 引擎 — sherpa-onnx 本地推理 (Matcha-TTS) + 磁盘缓存
+
+特点:
+  - 纯本地推理，无需联网，延迟极低 (RTF ≈ 0.08)
+  - Matcha-TTS + HiFi-GAN vocoder
+  - 磁盘缓存：常用短语秒级响应
+  - 保留 SAPI 保底 fallback
 """
 
-import asyncio
-import edge_tts
-import io
-import numpy as np
-import miniaudio
+import os
+import time
+import hashlib
 import threading
 import queue
-import os
 import subprocess
 import tempfile
-import struct
+import numpy as np
+import sherpa_onnx
 from typing import Optional
 
 
 class TTSEngine:
-    """文本转语音引擎 (基于 edge-tts)"""
+    """文本转语音引擎 (基于 sherpa-onnx Matcha-TTS 本地推理)"""
 
-    # 推荐中文语音
-    VOICES = {
-        "xiaoxiao": "zh-CN-XiaoxiaoNeural",   # 女声，温柔
-        "yunxi": "zh-CN-YunxiNeural",          # 男声，自然
-        "xiaoyi": "zh-CN-XiaoyiNeural",        # 女声，活泼
-        "yunjian": "zh-CN-YunjianNeural",       # 男声，沉稳
+    # 支持的模型配置
+    MODELS = {
+        "matcha-zh-baker": {
+            "type": "matcha",
+            "dir": "matcha-icefall-zh-baker",
+            "acoustic_model": "model-steps-3.onnx",
+            "vocoder": "hifigan_v2.onnx",
+            "lexicon": "lexicon.txt",
+            "tokens": "tokens.txt",
+            "dict_dir": "dict",
+            "description": "中文女声 (Baker, 22050Hz)",
+        },
+        "melo-zh": {
+            "type": "vits",
+            "dir": "vits-melo-tts-zh_en",
+            "model": "model.onnx",
+            "lexicon": "lexicon.txt",
+            "tokens": "tokens.txt",
+            "description": "中文女声 (MeloTTS, 44100Hz)",
+        },
     }
 
     # 常用短语预缓存列表
     PRECACHE_PHRASES = [
         "好的", "我在", "好的，我来查一下", "好的，我来处理一下",
-        "好的，稍等", "好的，已停止", "我在，请说",
+        "好的，稍等", "好的，已终止", "我在，请说",
         "语音助手已启动，说小乐小乐唤醒我",
         "好的，再见", "好的，我来看看", "嗯", "好",
         "好的，我来帮你", "好的，马上",
+        "连续对话已结束，需要时再叫我",
     ]
 
     # 磁盘缓存目录
     CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cache", "tts")
 
-    def __init__(self, voice: str = "xiaoxiao", rate: str = "+0%", volume: str = "+0%"):
-        self.voice = self.VOICES.get(voice, voice)
-        self.rate = rate
-        self.volume = volume
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-        self._cache: dict[str, Optional[np.ndarray]] = {}  # TTS音频缓存
+    def __init__(self, voice: str = "matcha-zh-baker", speed: float = 1.0,
+                 models_dir: str = None, num_threads: int = 4):
+        self.voice = voice
+        self.speed = speed
+        self.num_threads = num_threads
+        self._models_dir = models_dir or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "models"
+        )
+        self._tts: Optional[sherpa_onnx.OfflineTts] = None
+        self._cache: dict[str, Optional[np.ndarray]] = {}
         self._cache_lock = threading.Lock()
-        self._init_event_loop()
-        # 确保磁盘缓存目录存在
         os.makedirs(self.CACHE_DIR, exist_ok=True)
+        self._init_tts()
 
-    def _init_event_loop(self):
-        """初始化独立的事件循环线程"""
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
-        self._thread.start()
+    def _init_tts(self):
+        """初始化 sherpa-onnx TTS 引擎"""
+        model_cfg = self.MODELS.get(self.voice)
+        if model_cfg is None:
+            raise ValueError(f"未知模型: {self.voice}, 可选: {list(self.MODELS.keys())}")
 
-    def _run_async(self, coro):
-        """在事件循环中运行协程"""
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=30)
+        model_dir = os.path.join(self._models_dir, model_cfg["dir"])
+        if not os.path.isdir(model_dir):
+            raise FileNotFoundError(f"模型目录不存在: {model_dir}")
 
-    async def _synthesize_to_bytes(self, text: str) -> bytes:
-        """合成语音并返回 mp3 字节"""
-        communicate = edge_tts.Communicate(text, self.voice, rate=self.rate, volume=self.volume)
-        audio_bytes = b""
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_bytes += chunk["data"]
-        return audio_bytes
+        model_type = model_cfg["type"]
+
+        if model_type == "matcha":
+            config = sherpa_onnx.OfflineTtsConfig(
+                model=sherpa_onnx.OfflineTtsModelConfig(
+                    matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
+                        acoustic_model=os.path.join(model_dir, model_cfg["acoustic_model"]),
+                        vocoder=os.path.join(model_dir, model_cfg["vocoder"]),
+                        lexicon=os.path.join(model_dir, model_cfg["lexicon"]),
+                        tokens=os.path.join(model_dir, model_cfg["tokens"]),
+                        dict_dir=os.path.join(model_dir, model_cfg.get("dict_dir", "")),
+                        length_scale=1.0,
+                    ),
+                    num_threads=self.num_threads,
+                ),
+            )
+        elif model_type == "vits":
+            config = sherpa_onnx.OfflineTtsConfig(
+                model=sherpa_onnx.OfflineTtsModelConfig(
+                    vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                        model=os.path.join(model_dir, model_cfg["model"]),
+                        lexicon=os.path.join(model_dir, model_cfg["lexicon"]),
+                        tokens=os.path.join(model_dir, model_cfg["tokens"]),
+                        dict_dir=os.path.join(model_dir, model_cfg.get("dict_dir", model_dir)),
+                        length_scale=0.9,
+                    ),
+                    num_threads=self.num_threads,
+                ),
+            )
+        else:
+            raise ValueError(f"不支持的模型类型: {model_type}")
+
+        self._tts = sherpa_onnx.OfflineTts(config)
+        print(f"[TTS] 本地模型: {model_cfg['description']}")
+        print(f"[TTS] 采样率: {self._tts.sample_rate}Hz, 说话人: {self._tts.num_speakers}")
+
+    @property
+    def sample_rate(self) -> int:
+        """输出音频采样率"""
+        return self._tts.sample_rate if self._tts else 24000
 
     def _cache_file_path(self, text: str) -> str:
-        """根据文本+语音+语速生成磁盘缓存文件路径"""
-        import hashlib
-        key = f"{self.voice}_{self.rate}_{self.volume}_{text}"
+        """根据文本+模型+语速生成磁盘缓存文件路径"""
+        key = f"{self.voice}_{self.speed}_{text}"
         h = hashlib.md5(key.encode('utf-8')).hexdigest()
         return os.path.join(self.CACHE_DIR, f"{h}.npy")
 
@@ -97,7 +148,7 @@ class TTSEngine:
             print(f"[TTS] 磁盘缓存写入失败: {e}")
 
     def precache(self, phrases: list[str] = None):
-        """预缓存常用短语的TTS音频，优先从磁盘加载，未命中再合成并存盘"""
+        """预缓存常用短语的TTS音频"""
         phrases = phrases or self.PRECACHE_PHRASES
         print(f"[TTS] 预缓存 {len(phrases)} 个常用短语...")
 
@@ -121,26 +172,17 @@ class TTSEngine:
             return
 
         print(f"[TTS] 需合成 {len(need_synth)} 个...")
-
-        def _cache_one(phrase):
+        synth_count = 0
+        for phrase in need_synth:
             try:
-                mp3_data = self._run_async(self._synthesize_to_bytes(phrase))
-                if mp3_data:
-                    audio = self._decode_mp3(mp3_data)
-                    if audio is not None:
-                        with self._cache_lock:
-                            self._cache[phrase] = audio
-                        self._save_to_disk(phrase, audio)
+                audio = self._do_synthesize(phrase)
+                if audio is not None:
+                    with self._cache_lock:
+                        self._cache[phrase] = audio
+                    self._save_to_disk(phrase, audio)
+                    synth_count += 1
             except Exception as e:
                 print(f"[TTS] 预缓存失败 '{phrase}': {e}")
-
-        threads = []
-        for phrase in need_synth:
-            t = threading.Thread(target=_cache_one, args=(phrase,), daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join(timeout=15)
 
         with self._cache_lock:
             cached = len([v for v in self._cache.values() if v is not None])
@@ -151,89 +193,63 @@ class TTSEngine:
         with self._cache_lock:
             return self._cache.get(text)
 
-    def synthesize(self, text: str, retries: int = 3) -> Optional[np.ndarray]:
-        """合成语音，返回 numpy 音频数组 (float32, 24kHz)，优先用缓存，失败自动重试"""
+    def _do_synthesize(self, text: str, sid: int = 0) -> Optional[np.ndarray]:
+        """底层合成调用"""
+        if self._tts is None:
+            return None
+        try:
+            audio = self._tts.generate(text, sid=sid, speed=self.speed)
+            if audio and audio.samples:
+                return np.array(audio.samples, dtype=np.float32)
+        except Exception as e:
+            print(f"[TTS] 本地合成错误: {e}")
+        return None
+
+    def synthesize(self, text: str, retries: int = 2) -> Optional[np.ndarray]:
+        """合成语音，返回 numpy 音频数组 (float32)"""
         # 先查缓存
         cached = self.get_cached(text)
         if cached is not None:
             return cached.copy()
 
-        import time as _time
         for attempt in range(retries):
-            try:
-                mp3_data = self._run_async(self._synthesize_to_bytes(text))
-                if mp3_data:
-                    audio = self._decode_mp3(mp3_data)
-                    if audio is not None:
-                        # 缓存合成结果，避免相同文本重复请求
-                        with self._cache_lock:
-                            if len(self._cache) < 200:  # 限制缓存大小
-                                self._cache[text] = audio
-                        return audio
-                print(f"[TTS] 第{attempt+1}次合成无数据，重试...")
-            except Exception as e:
-                print(f"[TTS] 第{attempt+1}次合成错误: {e}")
-                if 'connect' in str(e).lower() or 'timeout' in str(e).lower():
-                    print(f"[TTS] 网络连接异常，请检查网络")
-            _time.sleep(0.3 * (attempt + 1))  # 递增等待
-        print(f"[TTS] edge-tts 合成失败，已重试{retries}次，尝试本地 SAPI: {text[:30]}")
+            audio = self._do_synthesize(text)
+            if audio is not None and len(audio) > 0:
+                # 缓存合成结果
+                with self._cache_lock:
+                    if len(self._cache) < 200:
+                        self._cache[text] = audio
+                return audio
+            print(f"[TTS] 第{attempt+1}次合成失败，重试...")
+            time.sleep(0.1)
+
+        print(f"[TTS] 本地合成失败，尝试 SAPI 保底: {text[:30]}")
         return self._fallback_sapi(text)
 
     def synthesize_to_file(self, text: str, output_path: str) -> bool:
-        """合成语音到文件"""
+        """合成语音到文件 (WAV)"""
         try:
-            mp3_data = self._run_async(self._synthesize_to_bytes(text))
-            if mp3_data:
-                with open(output_path, 'wb') as f:
-                    f.write(mp3_data)
+            audio = self.synthesize(text)
+            if audio is not None:
+                import wave
+                with wave.open(output_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(self.sample_rate)
+                    wf.writeframes((audio * 32767).astype(np.int16).tobytes())
                 return True
         except Exception as e:
             print(f"[TTS] 合成到文件错误: {e}")
         return False
 
-    def synthesize_streaming(self, text: str, audio_queue: queue.Queue,
-                              done_event: threading.Event):
-        """流式合成：边生成边放入队列"""
-        def _worker():
-            try:
-                async def _stream():
-                    communicate = edge_tts.Communicate(text, self.voice,
-                                                        rate=self.rate, volume=self.volume)
-                    buffer = b""
-                    async for chunk in communicate.stream():
-                        if chunk["type"] == "audio":
-                            buffer += chunk["data"]
-                            # 攒够一定量再解码
-                            if len(buffer) > 8192:
-                                audio = self._decode_mp3(buffer)
-                                if audio is not None and len(audio) > 0:
-                                    audio_queue.put(audio)
-                                buffer = b""
-                    # 处理剩余
-                    if buffer:
-                        audio = self._decode_mp3(buffer)
-                        if audio is not None and len(audio) > 0:
-                            audio_queue.put(audio)
-                    audio_queue.put(None)  # sentinel
-                    done_event.set()
-
-                self._run_async(_stream())
-            except Exception as e:
-                print(f"[TTS] 流式合成错误: {e}")
-                done_event.set()
-
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        return t
-
-    def _fallback_sapi(self, text: str, sample_rate: int = 24000) -> Optional[np.ndarray]:
+    def _fallback_sapi(self, text: str) -> Optional[np.ndarray]:
         """Windows SAPI 保底 TTS，无需网络"""
+        target_sr = self.sample_rate
         tmp_wav = None
         tmp_ps1 = None
         try:
             tmp_fd, tmp_wav = tempfile.mkstemp(suffix='.wav')
             os.close(tmp_fd)
-            # 写 PowerShell 脚本文件，避免命令行转义问题
             tmp_ps1 = tmp_wav.replace('.wav', '.ps1')
             safe_text = text.replace('"', "'").replace('\n', ' ')
             with open(tmp_ps1, 'w', encoding='utf-8-sig') as f:
@@ -254,7 +270,7 @@ class TTSEngine:
             if not os.path.exists(tmp_wav) or os.path.getsize(tmp_wav) < 100:
                 print("[TTS-SAPI] WAV 文件无效")
                 return None
-            audio = self._decode_wav(tmp_wav, sample_rate)
+            audio = self._decode_wav(tmp_wav, target_sr)
             if audio is not None:
                 print(f"[TTS-SAPI] 保底合成OK: {len(audio)} samples")
             return audio
@@ -281,7 +297,6 @@ class TTSEngine:
                 n_frames = wf.getnframes()
                 raw = wf.readframes(n_frames)
 
-            # 转 float32
             if sample_width == 2:
                 samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
             elif sample_width == 1:
@@ -289,11 +304,9 @@ class TTSEngine:
             else:
                 return None
 
-            # 取单声道
             if n_channels > 1:
                 samples = samples[::n_channels]
 
-            # 重采样
             if src_sr != target_sr:
                 duration = len(samples) / src_sr
                 target_len = int(duration * target_sr)
@@ -305,39 +318,38 @@ class TTSEngine:
             print(f"[TTS-SAPI] WAV 解码错误: {e}")
             return None
 
-    @staticmethod
-    def _decode_mp3(mp3_data: bytes, sample_rate: int = 24000) -> Optional[np.ndarray]:
-        """用 miniaudio 解码 MP3 数据为 float32 numpy 数组"""
-        try:
-            decoded = miniaudio.decode(mp3_data,
-                                       output_format=miniaudio.SampleFormat.FLOAT32,
-                                       nchannels=1,
-                                       sample_rate=sample_rate)
-            return np.frombuffer(decoded.samples, dtype=np.float32).copy()
-        except Exception as e:
-            print(f"[TTS] MP3 解码错误: {e}")
-            return None
-
 
 if __name__ == "__main__":
     import sys
     sys.path.insert(0, os.path.dirname(__file__))
-    from audio_io import AudioPlayer, find_bluetooth_devices
+    import sounddevice as sd
 
-    print("=== TTS 引擎测试 ===")
-    tts = TTSEngine(voice="xiaoxiao")
+    print("=== TTS 引擎测试 (本地 Matcha-TTS) ===")
+    tts = TTSEngine(voice="matcha-zh-baker", speed=1.0)
 
-    text = "你好，我是语音助手小派，很高兴为你服务！"
-    print(f"合成: {text}")
+    texts = [
+        "你好，我是语音助手小乐，很高兴为你服务！",
+        "好的，我来帮你查一下天气。",
+        "今天北京晴，最高温度二十五度，适合出行。",
+        "好的，我来处理一下。",
+    ]
 
-    audio = tts.synthesize(text)
-    if audio is not None:
-        print(f"合成完成: {len(audio)} 样本, {len(audio)/24000:.1f} 秒")
+    for text in texts:
+        t0 = time.time()
+        audio = tts.synthesize(text)
+        elapsed = time.time() - t0
+        if audio is not None:
+            duration = len(audio) / tts.sample_rate
+            print(f"{text}")
+            print(f"  合成 {elapsed:.3f}s → 时长 {duration:.2f}s (RTF={elapsed/duration:.3f})")
+            sd.play(audio, samplerate=tts.sample_rate)
+            sd.wait()
+            time.sleep(0.3)
+        else:
+            print(f"  合成失败: {text}")
 
-        _, output_id = find_bluetooth_devices()
-        player = AudioPlayer(device_id=output_id, sample_rate=24000)
-        print("播放中...")
-        player.play(audio, blocking=True)
-        print("播放完成")
-    else:
-        print("合成失败")
+    print("\n=== 预缓存测试 ===")
+    tts.precache()
+    t0 = time.time()
+    audio = tts.synthesize("好的，我来查一下")
+    print(f"缓存命中: {time.time()-t0:.4f}s")
