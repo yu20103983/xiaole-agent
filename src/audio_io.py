@@ -65,7 +65,7 @@ def find_bluetooth_devices(keyword: str = "漫步者") -> tuple[Optional[int], O
     return input_id, output_id, info
 
 
-def auto_detect_devices() -> dict:
+def auto_detect_devices(prefer_local_input: bool = False) -> dict:
     """自动检测最佳音频输入/输出设备
 
     策略（按优先级）：
@@ -153,6 +153,19 @@ def auto_detect_devices() -> dict:
         result['output_sr'] = int(dev['default_samplerate'])
         result['output_name'] = dev['name']
         result['output_api'] = api
+
+    # ---- 分离模式：本地麦克风输入 + 蓝牙A2DP输出（同时工作）----
+    if prefer_local_input and bt_stereo_outputs and local_inputs:
+        li, ld, lapi, *_ = local_inputs[0]
+        si, sd_dev, sapi, sbt, _ = bt_stereo_outputs[0]
+        _set_input(li, ld, lapi)
+        _set_output(si, sd_dev, sapi)
+        result['bt_name'] = sbt
+        result['mode'] = 'split'
+        print(f"[Audio] 分离模式: 本地麦克风输入 + 蓝牙A2DP输出")
+        print(f"  输入: #{li} [{lapi}] {ld['name']} ({result['input_sr']}Hz)")
+        print(f"  输出: #{si} [{sapi}] {sd_dev['name']} ({result['output_sr']}Hz)")
+        return result
 
     # ---- 策略1: 蓝牙一体（同名设备的 HFP 输入 + Stereo 输出）----
     for hi, hd, hapi, hbt, _ in bt_hfp_inputs:

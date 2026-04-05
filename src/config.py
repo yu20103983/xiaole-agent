@@ -8,6 +8,7 @@ A2DP_ID = None            # A2DP 输出设备 ID (None=自动)
 A2DP_SR = None            # A2DP 采样率 (None=自动)
 HFP_IN = None             # HFP 输入设备 ID (None=自动)
 HFP_IN_SR = None          # HFP 输入采样率 (None=自动)
+SPLIT_IO = True           # 分离模式：本地麦克风输入 + 蓝牙A2DP输出（支持同时输入输出）
 
 # ============ TTS ============
 TTS_VOICE = "xiaoxiao"    # TTS 语音：xiaoxiao/yunxi/xiaoyi/yunjian

@@ -1,8 +1,8 @@
 """
-蓝牙语音 Pi Agent — v3
+蓝牙语音 Pi Agent - v3
 1. 打断词"停止"
-2. agent执行前先汇报，回复简短
-3. 长输入：积累多句后再送agent；"小派我要长段输入"→等"好了"
+2. agent执行前先汇报,回复简短
+3. 长输入:积累多句后再送agent;"小派我要长段输入"→等"好了"
 """
 import sys, os, time, signal, threading, re, queue
 import numpy as np
@@ -20,7 +20,7 @@ from config import *
 
 # ============ 设备自动检测 ============
 def _init_audio_devices():
-    """ 自动检测音频设备，配置中为 None 的项自动填充"""
+    """ 自动检测音频设备,配置中为 None 的项自动填充"""
     global A2DP_ID, A2DP_SR, HFP_IN, HFP_IN_SR
     if A2DP_ID is not None and HFP_IN is not None:
         print(f"[Audio] 使用配置: 输入=#{HFP_IN}({HFP_IN_SR}Hz) 输出=#{A2DP_ID}({A2DP_SR}Hz)")
@@ -35,19 +35,23 @@ def _init_audio_devices():
 
 _init_audio_devices()
 
-SYSTEM_PROMPT = """你是"小乐"，通过蓝牙耳机与用户语音对话的个人助理。
+SYSTEM_PROMPT = """你是“小乐”，通过耳机与用户语音对话的个人助理。
+
+★★★ 最重要的规则 ★★★
+你的回复会被 TTS 实时播报，用户在等你说话。
+所以你必须：先说一句话（如“好的，我来查一下”），然后再执行工具/命令。
+绝对禁止先执行工具再说话，否则用户会长时间听不到任何声音。
 
 核心能力：
-1. 你拥有完整的系统操作能力：执行任意命令行、读写文件、安装软件、管理进程
-2. 你可以联网：用 curl/wget 搜索、下载、访问 API、爬取网页
-3. 你可以编写和执行代码（Python/Node/PowerShell等）来完成复杂任务
-4. 遇到不会的事，主动搜索解决方案，不要说"做不到"
+1. 完整的系统操作能力：执行任意命令行、读写文件、安装软件、管理进程
+2. 联网能力：用 curl/wget 搜索、下载、访问 API、爬取网页
+3. 编程能力：Python/Node/PowerShell等
+4. 遇到不会的事，主动搜索解决方案
 
 回复规则（回复会被 TTS 播放）：
 1. 简洁口语化，禁止 markdown、表格、代码块、emoji、特殊符号
 2. 一般回复 2-3 句话，列举不超过3条
-3. 执行操作前先说一句“好的，我来xxx”让用户知道你在工作
-4. 执行完只说结果，不重复过程
+3. 执行完只说结果，不重复过程
 
 行动原则：
 - 用户让你做什么就做什么，不要反问“你确定吗”
@@ -127,7 +131,7 @@ def speak_async(text, then_state=None):
 STOP_CHARS = set('停听挺庭叮顶定丁町亭铤廷婷')
 
 def start_interrupt_listen(stop_event):
-    """开始监听打断（非阻塞），检测到'停'音时设置stop_event"""
+    """开始监听打断(非阻塞),检测到'停'音时设置stop_event"""
     def _on_final(text):
         print(f"\n  [监听] {text}", flush=True)
         if any(c in text for c in STOP_CHARS) or 'stop' in text.lower():
@@ -155,8 +159,8 @@ def handle_command(cmd):
     # 流式文本收集
     sentence_queue = queue.Queue()
     buf = {"text": "", "done": False}
-    # 切句：逗号切短句，句号/问号/叹号切长句
-    CLAUSE_PAT = re.compile(r'[,，;；、]|[。！？!?\n]')
+    # 切句:逗号切短句,句号/问号/叹号切长句
+    CLAUSE_PAT = re.compile(r'[,,;;、]|[。!?!?\n]')
 
     def on_delta(delta):
         print(delta, end="", flush=True)
@@ -167,7 +171,7 @@ def handle_command(cmd):
                 break
             pos = m.end()
             sep_char = m.group()
-            is_sentence_end = sep_char in '。！？!?\n'
+            is_sentence_end = sep_char in '。!?!?\n'
             s = clean_for_speech(buf["text"][:pos].strip())
             buf["text"] = buf["text"][pos:]
             if s and len(s) > 1:
@@ -190,10 +194,10 @@ def handle_command(cmd):
     #   - 每个短句独立合成
     #
     # merges[(start, end)] = {text, audio, ready(Event)}
-    #   - 合并文本的 TTS 结果，让 TTS 理解上下文产生连贯语气
-    #   - 最多合4个短句，不跨句号边界
+    #   - 合并文本的 TTS 结果,让 TTS 理解上下文产生连贯语气
+    #   - 最多合4个短句,不跨句号边界
     #
-    # 播放时：从 play_idx 找最长已就绪的合并音频，没有就用单句
+    # 播放时:从 play_idx 找最长已就绪的合并音频,没有就用单句
     #
     clauses = []          # 有序短句列表
     merges = {}           # {(start, end): {text, audio, ready}}
@@ -206,7 +210,7 @@ def handle_command(cmd):
     synth_sem = threading.Semaphore(4)  # 最多4个并发合成
 
     def _do_synth(item):
-        """合成一个音频项（clause 或 merge）"""
+        """合成一个音频项(clause 或 merge)"""
         synth_sem.acquire()
         try:
             if stop_event.is_set():
@@ -217,13 +221,13 @@ def handle_command(cmd):
             synth_sem.release()
 
     def _submit_merges_for(new_idx):
-        """新短句到达后，创建以它结尾的合并项（长度2~MAX_MERGE_CLAUSES）"""
+        """新短句到达后,创建以它结尾的合并项(长度2~MAX_MERGE_CLAUSES)"""
         with clauses_lock:
             for length in range(2, MAX_MERGE_CLAUSES + 1):
                 start = new_idx - length + 1
                 if start < 0:
                     continue
-                # 检查中间不跨句号边界：start ~ new_idx-1 都不能是句末
+                # 检查中间不跨句号边界:start ~ new_idx-1 都不能是句末
                 can_merge = True
                 for i in range(start, new_idx):
                     if clauses[i]["is_sent_end"]:
@@ -234,12 +238,12 @@ def handle_command(cmd):
                 key = (start, new_idx)
                 if key in merges:
                     continue
-                # 拼接合并文本（用逗号连接）
-                merged_text = "，".join(clauses[i]["text"] for i in range(start, new_idx + 1))
+                # 拼接合并文本(用逗号连接)
+                merged_text = ",".join(clauses[i]["text"] for i in range(start, new_idx + 1))
                 merge_item = {"text": merged_text, "audio": None, "ready": threading.Event()}
                 merges[key] = merge_item
 
-            # 复制要合成的项（锁外启动线程）
+            # 复制要合成的项(锁外启动线程)
             new_merges = {k: v for k, v in merges.items()
                          if k[1] == new_idx and not v["ready"].is_set()}
 
@@ -248,7 +252,7 @@ def handle_command(cmd):
             threading.Thread(target=_do_synth, args=(item,), daemon=True).start()
 
     def _collector():
-        """收集线程：取短句 → 启动单句合成 + 合并合成"""
+        """收集线程:取短句 → 启动单句合成 + 合并合成"""
         while not stop_event.is_set():
             try:
                 text, is_sent_end = sentence_queue.get(timeout=0.3)
@@ -263,7 +267,7 @@ def handle_command(cmd):
                 idx = len(clauses)
                 clauses.append(item)
 
-            print(f"  [#{idx}] {text[:40]}{'。' if is_sent_end else '，'}", flush=True)
+            print(f"  [#{idx}] {text[:40]}{'。' if is_sent_end else ','}", flush=True)
             threading.Thread(target=_do_synth, args=(item,), daemon=True).start()
             _submit_merges_for(idx)
 
@@ -272,12 +276,12 @@ def handle_command(cmd):
     collector_thread = threading.Thread(target=_collector, daemon=True)
     collector_thread.start()
 
-    # ========== 主线程：FIFO顺序播放 ==========
+    # ========== 主线程:FIFO顺序播放 ==========
     play_idx = 0
     first_play = True  # 首次播放需要BT切换
 
     def _find_best_audio():
-        """从 play_idx 开始，找最长的已就绪合并音频。
+        """从 play_idx 开始,找最长的已就绪合并音频。
         返回 (audio, text, next_play_idx) 或 None"""
         with clauses_lock:
             n = len(clauses)
@@ -309,7 +313,7 @@ def handle_command(cmd):
                 try: sentence_queue.get_nowait()
                 except: break
             time.sleep(1)
-            play_simple("好的，已停止")
+            play_simple("好的,已停止")
             break
 
         with clauses_lock:
@@ -339,7 +343,7 @@ def handle_command(cmd):
         audio, text, next_idx = best
         span = next_idx - play_idx
 
-        # 单句就绪但合并项正在合成 → 短等给合并机会（首句不等）
+        # 单句就绪但合并项正在合成 → 短等给合并机会(首句不等)
         if span == 1 and not first_play:
             pending_keys = [k for k in merges if k[0] == play_idx and not merges[k]["ready"].is_set()]
             if pending_keys:
@@ -350,7 +354,7 @@ def handle_command(cmd):
                     audio, text, next_idx = better
                     span = next_idx - play_idx
 
-        # HFP→A2DP 切换（仅在监听后）
+        # HFP→A2DP 切换(仅在监听后)
         if listening:
             stop_interrupt_listen()
             listening = False
@@ -361,7 +365,7 @@ def handle_command(cmd):
         if stop_event.is_set():
             continue
 
-        # 首次播放：加静音前缀让蓝牙就绪
+        # 首次播放:加静音前缀让蓝牙就绪
         if first_play:
             sd.stop()
             time.sleep(0.3)
@@ -382,7 +386,7 @@ def handle_command(cmd):
 
     processing = False
     session.set_state(SessionState.ACTIVE)
-    # 恢复正常 ASR 回调（打断监听期间会被替换）
+    # 恢复正常 ASR 回调(打断监听期间会被替换)
     asr.set_callbacks(on_final=on_asr_final)
     asr.reset()
     recorder.start(callback=feed_audio)
@@ -415,38 +419,38 @@ def reset_input_timer():
 
 # ============ 会话回调 ============
 def on_wake():
-    speak_async("我在，请说")
+    speak_async("我在,请说")
 
 def on_sleep():
     global long_input_mode, input_buffer
     long_input_mode = False
     input_buffer = []
-    speak_async("好的，再见")
+    speak_async("好的,再见")
 
 def on_command(cmd):
     global long_input_mode, input_buffer
 
     if processing:
-        # 播放中无法用此路径打断（打断由 listen_for_interrupt 处理）
+        # 播放中无法用此路径打断(打断由 listen_for_interrupt 处理)
         return
 
     # 检测长输入模式触发
     if re.search(r'(长段|长篇|多段|详细)(输入|说明|描述)', cmd):
         long_input_mode = True
         input_buffer = []
-        speak_async("好的，请说，说完后说好了")
+        speak_async("好的,请说,说完后说好了")
         return
 
     if long_input_mode:
-        # 长输入模式：检测"好了"结束
-        if re.search(r'^好了[。．.！!]?$', cmd.strip()):
+        # 长输入模式:检测"好了"结束
+        if re.search(r'^好了[。..!!]?$', cmd.strip()):
             flush_input_buffer()
         else:
             input_buffer.append(cmd)
             print(f"  [积累] {cmd} (共{len(input_buffer)}段)", flush=True)
         return
 
-    # 普通模式：积累输入，等静音超时后发送
+    # 普通模式:积累输入,等静音超时后发送
     input_buffer.append(cmd)
     print(f"  [积累] {cmd} (等{INPUT_SILENCE_TIMEOUT}s静音)", flush=True)
     reset_input_timer()
@@ -469,8 +473,8 @@ def main():
     print("=" * 50)
     print("  🎧 蓝牙语音 Pi Agent v4")
     print("  '小乐小乐' 唤醒 | '小乐小乐退下' 休眠")
-    print("  '小乐，xxx' 发送指令（等静音后发送）")
-    print("  '小乐，长段输入' → 说完后说'好了'")
+    print("  '小乐,xxx' 发送指令(等静音后发送)")
+    print("  '小乐,长段输入' → 说完后说'好了'")
     print("  播放中说 '停止' 打断")
     print("  Ctrl+C 退出")
     print("=" * 50, flush=True)
@@ -485,7 +489,7 @@ def main():
     print("[Init] ✅ 就绪\n", flush=True)
 
     recorder.start(callback=feed_audio)
-    play_simple("语音助手已启动，说小乐小乐唤醒我")
+    play_simple("语音助手已启动,说小乐小乐唤醒我")
 
     def auto_sleep():
         while running:

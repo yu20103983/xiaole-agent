@@ -102,6 +102,14 @@ class PiClient:
                 if self._on_text_delta:
                     self._on_text_delta(delta)
 
+        elif event_type == "tool_execution_start":
+            # 工具开始执行，如果还没有任何文字输出，注入提示
+            if not self._current_response.strip() and self._on_text_delta:
+                tool_name = event.get("toolName", "")
+                hint = "好的，我来处理一下。"
+                self._current_response += hint
+                self._on_text_delta(hint)
+
         elif event_type == "agent_end":
             response = self._current_response.strip()
             if response and self._on_response_complete:
