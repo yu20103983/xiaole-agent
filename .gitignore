@@ -1,0 +1,11 @@
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+models/
+test_beep.wav
+*.wav
+*.mp3
+.pi/
+nul
+bin/
