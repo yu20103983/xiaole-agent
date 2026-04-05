@@ -270,6 +270,8 @@ class SessionController:
 
     def check_auto_sleep(self):
         """检查是否需要自动休眠"""
+        if self._auto_sleep_timeout <= 0:
+            return
         if (self.state == SessionState.ACTIVE and
                 time.time() - self._last_activity > self._auto_sleep_timeout):
             self.set_state(SessionState.SLEEPING)
