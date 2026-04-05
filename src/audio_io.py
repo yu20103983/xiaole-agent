@@ -122,18 +122,23 @@ def auto_detect_devices() -> dict:
             bt_stereo_outputs.append((i, d, hostapi, bt_name, pri))
         elif not is_bt:
             if d['max_input_channels'] > 0:
-                # 排除 Mapper/主声音 等虚拟设备
-                if 'Mapper' not in name and '主声音' not in name:
-                    local_inputs.append((i, d, hostapi, pri))
+                # 排除 Mapper/主声音 等虚拟设备和立体声混音
+                if 'Mapper' not in name and '主声音' not in name and '混音' not in name:
+                    # 输入优先级：线路输入/麦克风 > 其他
+                    in_pri = 0 if ('线路' in name or '麦克风' in name or
+                                   'Line' in name or 'Mic' in name) else 1
+                    local_inputs.append((i, d, hostapi, pri, in_pri))
             if d['max_output_channels'] > 0:
                 if 'Mapper' not in name and '主声音' not in name:
-                    local_outputs.append((i, d, hostapi, pri))
+                    # 输出优先级：扬声器/Speaker > HDMI/Digital
+                    out_pri = 0 if ('扬声器' in name or 'Speaker' in name) else 1
+                    local_outputs.append((i, d, hostapi, pri, out_pri))
 
     # 按 API 优先级排序
     bt_hfp_inputs.sort(key=lambda x: x[4])
     bt_stereo_outputs.sort(key=lambda x: x[4])
-    local_inputs.sort(key=lambda x: x[3])
-    local_outputs.sort(key=lambda x: x[3])
+    local_inputs.sort(key=lambda x: (x[4], x[3]))   # 先按设备类型优先级，再按API优先级
+    local_outputs.sort(key=lambda x: (x[4], x[3]))
 
     result = {}
 
@@ -178,7 +183,7 @@ def auto_detect_devices() -> dict:
     # ---- 策略3: 蓝牙+本地混合 ----
     if bt_hfp_inputs and local_outputs:
         hi, hd, hapi, hbt, _ = bt_hfp_inputs[0]
-        li, ld, lapi, _ = local_outputs[0]
+        li, ld, lapi, *_ = local_outputs[0]
         _set_input(hi, hd, hapi)
         _set_output(li, ld, lapi)
         result['bt_name'] = hbt
@@ -189,7 +194,7 @@ def auto_detect_devices() -> dict:
         return result
 
     if bt_stereo_outputs and local_inputs:
-        li, ld, lapi, _ = local_inputs[0]
+        li, ld, lapi, *_ = local_inputs[0]
         si, sd_dev, sapi, sbt, _ = bt_stereo_outputs[0]
         _set_input(li, ld, lapi)
         _set_output(si, sd_dev, sapi)
@@ -202,8 +207,8 @@ def auto_detect_devices() -> dict:
 
     # ---- 策略4: 纯本地 ----
     if local_inputs and local_outputs:
-        li, ld, lapi, _ = local_inputs[0]
-        lo, lod, loapi, _ = local_outputs[0]
+        li, ld, lapi, *_ = local_inputs[0]
+        lo, lod, loapi, *_ = local_outputs[0]
         _set_input(li, ld, lapi)
         _set_output(lo, lod, loapi)
         result['bt_name'] = None
