@@ -10,8 +10,8 @@
 ## 2. 一键安装
 
 ```bash
-git clone https://github.com/<your-username>/voice-agent.git
-cd voice-agent
+git clone https://github.com/<your-username>/xiaole.git
+cd xiaole
 setup.bat
 ```
 

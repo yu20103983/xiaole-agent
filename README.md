@@ -42,8 +42,8 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/<your-username>/voice-agent.git
-cd voice-agent
+git clone https://github.com/<your-username>/xiaole.git
+cd xiaole
 ```
 
 ### 2. 安装 Python 依赖
@@ -133,7 +133,7 @@ PI_MODEL = "claude-opus-4-6"
 ## 📁 项目结构
 
 ```
-voice-agent/
+xiaole/
 ├── src/
 │   ├── main.py               # 主程序：启动、音频播放、指令处理
 │   ├── config.py              # 全局配置
