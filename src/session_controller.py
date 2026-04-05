@@ -25,12 +25,14 @@ class SessionState(Enum):
 # ============ 模糊匹配工具 ============
 
 # "小乐" 的常见 ASR 误识别变体
-_XIAO_CHARS = r"[小肖晓消笑筱]"
+_XIAO_CHARS = r"[小肖晓消笑筱享向想响]"
 _LE_CHARS = r"[乐勒了乐洛落络罗]"
 # 匹配一个 "小乐" (含变体)，中间允许0-1个杂字
 _ONE_XL = _XIAO_CHARS + r".{0,1}" + _LE_CHARS
 # 匹配 "小乐小乐" (两次)，中间允许杂字/标点
 _TWO_XL = _ONE_XL + r".{0,3}" + _ONE_XL
+# 匹配 "X乐X乐" 模式（任意字+乐 重复两次，如 享乐享乐）
+_ANY_LE_TWICE = r"." + _LE_CHARS + r".{0,3}." + _LE_CHARS
 
 # "退下" 的常见变体
 _TUI_CHARS = r"[退对腿推]"
@@ -45,8 +47,13 @@ _PENDING_TIMEOUT = 5.0
 
 
 def _has_xiaole(text: str) -> bool:
-    """检测文本中是否包含至少一个 '小乐' (含近音变体)"""
-    return bool(re.search(_ONE_XL, text))
+    """检测文本中是否包含至少一个 '小乐' (含近音变体)
+    或 'X乐X乐' 模式（任意字+乐 重复两次）"""
+    if re.search(_ONE_XL, text):
+        return True
+    if re.search(_ANY_LE_TWICE, text):
+        return True
+    return False
 
 
 def _is_only_xiaole(text: str) -> bool:
@@ -64,6 +71,14 @@ def _strip_xiaole_prefix(text: str) -> str:
         return text[m.end():].strip()
     # 再尝试去掉单个 "小乐" 前缀
     m = re.match(_ONE_XL + r"[,，:：。.、\s]*", text)
+    if m:
+        return text[m.end():].strip()
+    # 尝试去掉 "X乐X乐" 前缀
+    m = re.match(_ANY_LE_TWICE + r"[,，:：。.、\s]*", text)
+    if m:
+        return text[m.end():].strip()
+    # 尝试去掉开头的单独 "乐" (被截断的前缀)
+    m = re.match(_LE_CHARS + r"[,，:：。.、\s]*", text)
     if m:
         return text[m.end():].strip()
     return ""
@@ -178,7 +193,26 @@ class SessionController:
             print(f"[Session] 等待指令... ({text})")
             return
 
-        # 4. 上下文关联：前面刚说了"小乐"，这句是指令内容
+        # 4. 以"乐"开头（ASR截断了"小"）→ 尝试剥离"乐"前缀提取指令
+        le_prefix = re.match(_LE_CHARS + r"[,，:：。.、\s]*", text)
+        if le_prefix:
+            cmd = text[le_prefix.end():].strip()
+            cmd = re.sub(r'[。．.！!？?]+$', '', cmd).strip()
+            if cmd and len(cmd) > 1:
+                self._pending_command = False
+                self._transition(SessionState.PROCESSING)
+                print(f"[Session] 指令(乐前缀): {cmd}")
+                if self._on_command:
+                    self._on_command(cmd)
+                return
+            else:
+                # 只有"乐"，视为截断的唤醒词
+                self._pending_command = True
+                self._pending_time = time.time()
+                print(f"[Session] 等待指令(乐前缀)... ({text})")
+                return
+
+        # 5. 上下文关联：前面刚说了"小乐"，这句是指令内容
         if self._pending_command:
             elapsed = time.time() - self._pending_time
             if elapsed <= _PENDING_TIMEOUT:
@@ -259,6 +293,8 @@ if __name__ == "__main__":
         ("小洛小洛", True),
         ("小了", True),
         ("笑乐你好", True),
+        ("享乐享乐", True),   # X乐X乐 模式
+        ("享乐", True),         # 享 在 _XIAO_CHARS 中
         ("今天天气不错", False),
         ("好的", False),
     ]
@@ -379,6 +415,35 @@ if __name__ == "__main__":
     ctrl.process_text("随便说的话", is_final=True)
     assert len(results) == 0, f"超时不应触发: {results}"
     assert ctrl._pending_command == False
+    print("  OK!")
+
+    # 场景6: "享乐享乐" 唤醒
+    print("场景6: 享乐享乐 唤醒")
+    results.clear()
+    ctrl.state = SessionState.SLEEPING
+    ctrl._pending_command = False
+    ctrl.process_text("享乐享乐。", is_final=True)
+    assert ctrl.state == SessionState.ACTIVE, f"应为active, 实为{ctrl.state}"
+    print("  OK!")
+
+    # 场景7: 活跃态 "乐，帮我播放" 截断前缀
+    print("场景7: 乐，帮我播放(截断前缀)")
+    results.clear()
+    ctrl.state = SessionState.ACTIVE
+    ctrl._pending_command = False
+    ctrl.process_text("乐，帮我播放一首音乐。", is_final=True)
+    assert results[-1] == ("cmd", "帮我播放一首音乐"), f"指令错误: {results}"
+    print("  OK!")
+
+    # 场景8: 活跃态 "乐。" 只有乐 → pending
+    print("场景8: 乐。(截断唤醒)")
+    results.clear()
+    ctrl.state = SessionState.ACTIVE
+    ctrl._pending_command = False
+    ctrl.process_text("乐。", is_final=True)
+    assert ctrl._pending_command == True
+    ctrl.process_text("帮我查天气", is_final=True)
+    assert results[-1] == ("cmd", "帮我查天气"), f"指令错误: {results}"
     print("  OK!")
 
     print("\n=== 全部测试通过 ===")
