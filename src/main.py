@@ -21,16 +21,26 @@ from session_controller import SessionController, SessionState
 A2DP_ID = 11; A2DP_SR = 44100
 HFP_IN = 9; HFP_IN_SR = 44100
 
-SYSTEM_PROMPT = """你是"小派"，通过蓝牙耳机与用户语音对话的个人助理。
+SYSTEM_PROMPT = """你是"小乐"，通过蓝牙耳机与用户语音对话的个人助理。
 
-核心规则：
-1. 回复会被TTS播放，必须简洁口语化：
-   - 禁止markdown、表格、代码块、emoji、特殊符号
-   - 一般回复控制在2-3句话以内
-   - 列举事项不超过3条，用口语连接词而非编号
-2. 执行任何操作前，先说一句话告知用户你要做什么，例如"好的，我来查一下"或"正在帮你处理"，让用户知道你在工作
-3. 执行完毕后只说结果，不重复过程
-4. 你有文件读写、命令执行等工具能力，但汇报时要简洁"""
+核心能力：
+1. 你拥有完整的系统操作能力：执行任意命令行、读写文件、安装软件、管理进程
+2. 你可以联网：用 curl/wget 搜索、下载、访问 API、爬取网页
+3. 你可以编写和执行代码（Python/Node/PowerShell等）来完成复杂任务
+4. 遇到不会的事，主动搜索解决方案，不要说"做不到"
+
+回复规则（回复会被 TTS 播放）：
+1. 简洁口语化，禁止 markdown、表格、代码块、emoji、特殊符号
+2. 一般回复 2-3 句话，列举不超过3条
+3. 执行操作前先说一句“好的，我来xxx”让用户知道你在工作
+4. 执行完只说结果，不重复过程
+
+行动原则：
+- 用户让你做什么就做什么，不要反问“你确定吗”
+- 缺少工具就安装，缺少文件就下载，主动解决问题
+- 播放音乐可以用 PowerShell 调用系统播放器或下载音乐文件后播放
+- 查询信息可以用 curl 访问搜索引擎或 API
+- 充分发挥你的编程和系统操作能力，做一个真正有用的助手"""
 
 
 def clean_for_speech(text):
@@ -153,11 +163,35 @@ def handle_command(cmd):
     pi.set_callbacks(on_text_delta=on_delta, on_response_complete=on_complete)
     pi.prompt_async(cmd)
 
-    # 逐句播放 + 空闲时监听打断
-    first = True
+    # 逐句播放 + 预合成下一句 + 空闲时监听打断
+    # 所有音频设备操作(recorder/sd)均在主线程，避免蓝牙切换问题
     aborted = False
     stop_event = threading.Event()
     listening = False
+    first_play = True
+
+    # 预合成：后台线程合成下一句
+    prefetch = {"audio": None, "ready": threading.Event(), "sentence": None}
+
+    def _prefetch_synth(sentence):
+        """后台合成一句"""
+        prefetch["sentence"] = sentence
+        prefetch["audio"] = None
+        prefetch["ready"].clear()
+        def _do():
+            print(f"  [预合成] {sentence[:40]}", flush=True)
+            prefetch["audio"] = tts.synthesize(sentence)
+            prefetch["ready"].set()
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _get_next_sentence(timeout=0.5):
+        """从 sentence_queue 取下一句，返回 (sentence, is_done)"""
+        try:
+            return sentence_queue.get(timeout=timeout), False
+        except queue.Empty:
+            if buf["done"] and sentence_queue.empty():
+                return None, True
+            return None, False
 
     while True:
         # 检查打断
@@ -172,38 +206,58 @@ def handle_command(cmd):
             while not sentence_queue.empty():
                 try: sentence_queue.get_nowait()
                 except: break
-            # 等待 abort 完全完成后再播报
             time.sleep(1)
             play_simple("好的，已停止")
             break
 
-        # 尝试取句子
-        sentence = None
-        try:
-            sentence = sentence_queue.get(timeout=0.5)
-        except queue.Empty:
-            if buf["done"] and sentence_queue.empty():
-                break  # 全部完成
-            # 队列空但agent还在工作 → 空闲期，开始监听打断
+        # 取句子
+        sentence, is_done = _get_next_sentence()
+        if is_done:
+            break
+        if sentence is None:
+            # 空闲期 → 开始监听打断
             if not listening:
                 start_interrupt_listen(stop_event)
                 listening = True
             continue
 
-        # 有句子要播放 → 先停监听
+        # 有句子要播放 → 主线程停监听 + BT切换
         if listening:
             stop_interrupt_listen()
             listening = False
-            time.sleep(0.3)  # 等BT从 HFP 切回 A2DP
+            sd.stop()
+            time.sleep(0.5)  # 等 BT 切回 A2DP
 
         if stop_event.is_set():
-            continue  # 回到循环顶部处理打断
+            continue
 
-        print(f"  [播放] {sentence[:60]}", flush=True)
-        audio = tts.synthesize(sentence)
-        if audio is not None:
-            play_audio(audio, first=first)
-            first = False
+        # 合成当前句（或用预合成结果）
+        audio = None
+        if prefetch["ready"].is_set() and prefetch["sentence"] == sentence:
+            audio = prefetch["audio"]
+            print(f"  [命中预合成]", flush=True)
+        if audio is None:
+            print(f"  [合成] {sentence[:40]}", flush=True)
+            audio = tts.synthesize(sentence)
+
+        if audio is None:
+            continue
+
+        # 播放前启动下一句的预合成
+        next_s, _ = _get_next_sentence(timeout=0.05)
+        if next_s:
+            _prefetch_synth(next_s)
+
+        # 播放（仅第一句或 HFP切换后加静音前缀）
+        use_prefix = first_play
+        if first_play:
+            sd.stop()
+            time.sleep(0.3)
+        print(f"  [播放] {sentence[:40]}", flush=True)
+        play_audio(audio, first=use_prefix)
+        first_play = False
+
+        # 播放完毕，如果预合成的下一句已就绪，下次循环立即取用
 
     if not aborted:
         pi._response_event.wait(timeout=10)
@@ -214,6 +268,8 @@ def handle_command(cmd):
 
     processing = False
     session.set_state(SessionState.ACTIVE)
+    # 恢复正常 ASR 回调（打断监听期间会被替换）
+    asr.set_callbacks(on_final=on_asr_final)
     asr.reset()
     recorder.start(callback=feed_audio)
     print(flush=True)
@@ -297,10 +353,10 @@ def main():
     global running
 
     print("=" * 50)
-    print("  🎧 蓝牙语音 Pi Agent v3")
-    print("  '小派你好' 唤醒 | '小派退下' 休眠")
-    print("  '小派，xxx' 发送指令（等静音后发送）")
-    print("  '小派，长段输入' → 说完后说'好了'")
+    print("  🎧 蓝牙语音 Pi Agent v4")
+    print("  '小乐小乐' 唤醒 | '小乐小乐退下' 休眠")
+    print("  '小乐，xxx' 发送指令（等静音后发送）")
+    print("  '小乐，长段输入' → 说完后说'好了'")
     print("  播放中说 '停止' 打断")
     print("  Ctrl+C 退出")
     print("=" * 50, flush=True)
@@ -315,7 +371,7 @@ def main():
     print("[Init] ✅ 就绪\n", flush=True)
 
     recorder.start(callback=feed_audio)
-    play_simple("语音助手已启动，说小派你好唤醒我")
+    play_simple("语音助手已启动，说小乐小乐唤醒我")
 
     def auto_sleep():
         while running:
