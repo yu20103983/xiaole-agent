@@ -456,13 +456,13 @@ def check_duplex_support(input_id: int, input_sr: int, output_id: int, output_sr
             if input_ok:
                 in_stream.stop()
                 in_stream.close()
-        except:
+        except Exception:
             pass
         try:
             if output_ok:
                 out_stream.stop()
                 out_stream.close()
-        except:
+        except Exception:
             pass
 
     return result

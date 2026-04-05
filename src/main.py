@@ -2,8 +2,14 @@
 
 语音唤醒 → ASR 识别 → 会话状态机 → Agent 交互 → 流式 TTS 播报 → 语音打断
 """
-import sys, os, time, signal, threading, re, queue
+import os
+import re
+import sys
+import time
+import queue
+import threading
 import numpy as np
+
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -131,8 +137,8 @@ def clean_for_speech(text):
 
 
 def resample_to_a2dp(audio_float32):
-    """TTS采样率 float32 → A2DP采样率 float32"""
-    return fast_resample(audio_float32, tts.sample_rate, A2DP_SR)
+    """24kHz float32 → A2DP采样率 float32"""
+    return fast_resample(audio_float32, 24000, A2DP_SR)
 
 
 def play_audio(audio_float32, first=False):
@@ -145,7 +151,8 @@ def play_audio(audio_float32, first=False):
 
 # ============ 全局组件 ============
 asr = ASREngine()
-tts = TTSEngine(voice=TTS_VOICE, speed=TTS_SPEED)
+tts = TTSEngine(engine=TTS_ENGINE, voice=TTS_VOICE, rate=TTS_RATE,
+               local_model=TTS_LOCAL_MODEL)
 pi = PiClient(working_dir=PI_WORKING_DIR, provider=PI_PROVIDER, model=PI_MODEL)
 session = SessionController()
 recorder = AudioRecorder(device_id=HFP_IN, sample_rate=HFP_IN_SR, target_sr=16000,
@@ -392,10 +399,11 @@ def handle_command(cmd):
                 listening = False
             pi.abort()
             aborted = True
-            pi._response_event.wait(timeout=5)
+            pi.wait_response(timeout=5)
             while not sentence_queue.empty():
                 try: sentence_queue.get_nowait()
-                except: break
+                except queue.Empty:
+                    break
             time.sleep(1)
             play_simple("好的,已终止")
             break
@@ -464,7 +472,7 @@ def handle_command(cmd):
     collector_thread.join(timeout=5)
 
     if not aborted:
-        pi._response_event.wait(timeout=10)
+        pi.wait_response(timeout=10)
 
     if listening:
         stop_interrupt_listen()

@@ -1,51 +1,72 @@
-"""
-TTS 引擎 — sherpa-onnx 本地推理 (Matcha-TTS) + 磁盘缓存
+"""TTS 引擎 — edge-tts (默认) + Matcha-TTS 本地备选 + SAPI 保底
 
-特点:
-  - 纯本地推理，无需联网，延迟极低 (RTF ≈ 0.08)
-  - Matcha-TTS + HiFi-GAN vocoder
-  - 磁盘缓存：常用短语秒级响应
-  - 保留 SAPI 保底 fallback
+合成优先级:
+  edge-tts  → 在线微软语音，音质好，需联网
+  Matcha-TTS → sherpa-onnx 本地推理，RTF ≈ 0.08，离线可用
+  SAPI      → Windows 内置语音，最后保底
 """
 
 import os
 import time
 import hashlib
+import asyncio
 import threading
-import queue
 import subprocess
 import tempfile
 import numpy as np
-import sherpa_onnx
 from typing import Optional
+
+# edge-tts (可选依赖)
+try:
+    import edge_tts
+    _HAS_EDGE_TTS = True
+except ImportError:
+    _HAS_EDGE_TTS = False
+
+# sherpa-onnx (可选依赖)
+try:
+    import sherpa_onnx
+    _HAS_SHERPA = True
+except ImportError:
+    _HAS_SHERPA = False
+
+
+# ============ edge-tts 语音映射 ============
+EDGE_VOICES = {
+    "xiaoxiao": "zh-CN-XiaoxiaoNeural",
+    "yunxi":    "zh-CN-YunxiNeural",
+    "xiaoyi":   "zh-CN-XiaoyiNeural",
+    "yunjian":  "zh-CN-YunjianNeural",
+}
+
+# ============ 本地模型配置 ============
+LOCAL_MODELS = {
+    "matcha-zh-baker": {
+        "type": "matcha",
+        "dir": "matcha-icefall-zh-baker",
+        "acoustic_model": "model-steps-3.onnx",
+        "vocoder": "hifigan_v2.onnx",
+        "lexicon": "lexicon.txt",
+        "tokens": "tokens.txt",
+        "dict_dir": "dict",
+        "description": "中文女声 (Baker, 22050Hz)",
+    },
+}
 
 
 class TTSEngine:
-    """文本转语音引擎 (基于 sherpa-onnx Matcha-TTS 本地推理)"""
+    """文本转语音引擎
 
-    # 支持的模型配置
-    MODELS = {
-        "matcha-zh-baker": {
-            "type": "matcha",
-            "dir": "matcha-icefall-zh-baker",
-            "acoustic_model": "model-steps-3.onnx",
-            "vocoder": "hifigan_v2.onnx",
-            "lexicon": "lexicon.txt",
-            "tokens": "tokens.txt",
-            "dict_dir": "dict",
-            "description": "中文女声 (Baker, 22050Hz)",
-        },
-        "melo-zh": {
-            "type": "vits",
-            "dir": "vits-melo-tts-zh_en",
-            "model": "model.onnx",
-            "lexicon": "lexicon.txt",
-            "tokens": "tokens.txt",
-            "description": "中文女声 (MeloTTS, 44100Hz)",
-        },
-    }
+    支持三种后端:
+      - edge-tts: 微软在线语音 (默认, 音质最好)
+      - local: sherpa-onnx 本地推理 (离线, 低延迟)
+      - sapi: Windows SAPI (保底)
 
-    # 常用短语预缓存列表
+    edge-tts 失败时自动回退到本地模型。
+    """
+
+    OUTPUT_SR = 24000  # 统一输出采样率
+
     PRECACHE_PHRASES = [
         "好的", "我在", "好的，我来查一下", "好的，我来处理一下",
         "好的，稍等", "好的，已终止", "我在，请说",
@@ -55,227 +76,195 @@ class TTSEngine:
         "连续对话已结束，需要时再叫我",
     ]
 
-    # 磁盘缓存目录
     CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cache", "tts")
 
-    def __init__(self, voice: str = "matcha-zh-baker", speed: float = 1.0,
-                 models_dir: str = None, num_threads: int = 4):
-        self.voice = voice
-        self.speed = speed
-        self.num_threads = num_threads
+    def __init__(self, engine: str = "edge", voice: str = "xiaoxiao",
+                 rate: str = "+10%", local_model: str = "matcha-zh-baker",
+                 models_dir: str = None):
+        self.engine = engine          # "edge" or "local"
+        self.voice = voice            # edge-tts 语音名
+        self.rate = rate              # edge-tts 语速
+        self.local_model = local_model
         self._models_dir = models_dir or os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "models"
         )
-        self._tts: Optional[sherpa_onnx.OfflineTts] = None
+        # 内部状态
+        self._local_tts = None        # sherpa_onnx.OfflineTts
+        self._local_sr = 24000        # 本地模型采样率
+        self._edge_loop = None        # edge-tts 事件循环
+        self._edge_thread = None
+        self._edge_fail_count = 0
+        self._edge_max_fails = 3      # 连续失败 N 次后自动切换本地
         self._cache: dict[str, Optional[np.ndarray]] = {}
         self._cache_lock = threading.Lock()
+
         os.makedirs(self.CACHE_DIR, exist_ok=True)
-        self._init_tts()
 
-    def _init_tts(self):
-        """初始化 sherpa-onnx TTS 引擎"""
-        model_cfg = self.MODELS.get(self.voice)
-        if model_cfg is None:
-            raise ValueError(f"未知模型: {self.voice}, 可选: {list(self.MODELS.keys())}")
-
-        model_dir = os.path.join(self._models_dir, model_cfg["dir"])
-        if not os.path.isdir(model_dir):
-            raise FileNotFoundError(f"模型目录不存在: {model_dir}")
-
-        model_type = model_cfg["type"]
-
-        if model_type == "matcha":
-            config = sherpa_onnx.OfflineTtsConfig(
-                model=sherpa_onnx.OfflineTtsModelConfig(
-                    matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
-                        acoustic_model=os.path.join(model_dir, model_cfg["acoustic_model"]),
-                        vocoder=os.path.join(model_dir, model_cfg["vocoder"]),
-                        lexicon=os.path.join(model_dir, model_cfg["lexicon"]),
-                        tokens=os.path.join(model_dir, model_cfg["tokens"]),
-                        dict_dir=os.path.join(model_dir, model_cfg.get("dict_dir", "")),
-                        length_scale=1.0,
-                    ),
-                    num_threads=self.num_threads,
-                ),
-            )
-        elif model_type == "vits":
-            config = sherpa_onnx.OfflineTtsConfig(
-                model=sherpa_onnx.OfflineTtsModelConfig(
-                    vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                        model=os.path.join(model_dir, model_cfg["model"]),
-                        lexicon=os.path.join(model_dir, model_cfg["lexicon"]),
-                        tokens=os.path.join(model_dir, model_cfg["tokens"]),
-                        dict_dir=os.path.join(model_dir, model_cfg.get("dict_dir", model_dir)),
-                        length_scale=0.9,
-                    ),
-                    num_threads=self.num_threads,
-                ),
-            )
+        # 初始化
+        if self.engine == "edge" and _HAS_EDGE_TTS:
+            self._init_edge_loop()
+            print(f"[TTS] 引擎: edge-tts ({EDGE_VOICES.get(voice, voice)})")
+        elif self.engine == "local":
+            self._init_local()
+            print(f"[TTS] 引擎: 本地 ({self.local_model})")
         else:
-            raise ValueError(f"不支持的模型类型: {model_type}")
+            if self.engine == "edge" and not _HAS_EDGE_TTS:
+                print("[TTS] edge-tts 未安装，回退到本地模型")
+            self._init_local()
 
-        self._tts = sherpa_onnx.OfflineTts(config)
-        print(f"[TTS] 本地模型: {model_cfg['description']}")
-        print(f"[TTS] 采样率: {self._tts.sample_rate}Hz, 说话人: {self._tts.num_speakers}")
+        # 预加载本地备选（如果 edge 模式需要 fallback）
+        if self.engine == "edge" and _HAS_SHERPA:
+            threading.Thread(target=self._init_local, daemon=True).start()
 
     @property
     def sample_rate(self) -> int:
-        """输出音频采样率"""
-        return self._tts.sample_rate if self._tts else 24000
+        return self.OUTPUT_SR
 
-    def _cache_file_path(self, text: str) -> str:
-        """根据文本+模型+语速生成磁盘缓存文件路径"""
-        key = f"{self.voice}_{self.speed}_{text}"
-        h = hashlib.md5(key.encode('utf-8')).hexdigest()
-        return os.path.join(self.CACHE_DIR, f"{h}.npy")
+    # ==================== edge-tts ====================
 
-    def _load_from_disk(self, text: str) -> Optional[np.ndarray]:
-        """从磁盘加载缓存音频"""
-        path = self._cache_file_path(text)
-        if os.path.exists(path):
-            try:
-                return np.load(path)
-            except Exception:
-                pass
+    def _init_edge_loop(self):
+        """创建独立事件循环线程（edge-tts 需要 asyncio）"""
+        self._edge_loop = asyncio.new_event_loop()
+        self._edge_thread = threading.Thread(
+            target=self._edge_loop.run_forever, daemon=True
+        )
+        self._edge_thread.start()
+
+    def _edge_synthesize(self, text: str) -> Optional[np.ndarray]:
+        """edge-tts 在线合成，返回 float32 numpy (24kHz)"""
+        if not _HAS_EDGE_TTS or self._edge_loop is None:
+            return None
+        if self._edge_fail_count > self._edge_max_fails:
+            return None  # 已切换到本地
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._edge_generate(text), self._edge_loop
+            )
+            audio = future.result(timeout=10)
+            if audio is not None:
+                self._edge_fail_count = 0
+                return audio
+        except Exception as e:
+            self._edge_fail_count += 1
+            if self._edge_fail_count <= self._edge_max_fails:
+                print(f"[TTS] edge-tts 失败({self._edge_fail_count}): {e}")
+            elif self._edge_fail_count == self._edge_max_fails + 1:
+                print(f"[TTS] edge-tts 连续失败{self._edge_max_fails}次，自动切换本地")
         return None
 
-    def _save_to_disk(self, text: str, audio: np.ndarray):
-        """保存音频到磁盘缓存"""
+    async def _edge_generate(self, text: str) -> Optional[np.ndarray]:
+        """异步 edge-tts 合成"""
+        voice_id = EDGE_VOICES.get(self.voice, self.voice)
+        communicate = edge_tts.Communicate(text, voice_id, rate=self.rate)
+        chunks = []
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                chunks.append(chunk["data"])
+        if not chunks:
+            return None
+        mp3_data = b"".join(chunks)
+        return self._decode_mp3(mp3_data)
+
+    @staticmethod
+    def _decode_mp3(mp3_data: bytes) -> Optional[np.ndarray]:
+        """MP3 → float32 numpy (24kHz)"""
         try:
-            path = self._cache_file_path(text)
-            np.save(path, audio)
+            import miniaudio
+            decoded = miniaudio.decode(mp3_data, output_format=miniaudio.SampleFormat.SIGNED16,
+                                       nchannels=1, sample_rate=24000)
+            return np.frombuffer(decoded.samples, dtype=np.int16).astype(np.float32) / 32768.0
         except Exception as e:
-            print(f"[TTS] 磁盘缓存写入失败: {e}")
+            print(f"[TTS] MP3 解码失败: {e}")
+            return None
 
-    def precache(self, phrases: list[str] = None):
-        """预缓存常用短语的TTS音频"""
-        phrases = phrases or self.PRECACHE_PHRASES
-        print(f"[TTS] 预缓存 {len(phrases)} 个常用短语...")
+    # ==================== 本地 Matcha-TTS ====================
 
-        # 先从磁盘加载
-        need_synth = []
-        disk_loaded = 0
-        for phrase in phrases:
-            audio = self._load_from_disk(phrase)
-            if audio is not None:
-                with self._cache_lock:
-                    self._cache[phrase] = audio
-                disk_loaded += 1
-            else:
-                need_synth.append(phrase)
-
-        if disk_loaded > 0:
-            print(f"[TTS] 从磁盘加载 {disk_loaded} 个")
-
-        if not need_synth:
-            print(f"[TTS] 预缓存完成: {disk_loaded}/{len(phrases)} 个(全部命中磁盘)")
+    def _init_local(self):
+        """初始化本地 sherpa-onnx TTS"""
+        if self._local_tts is not None:
+            return
+        if not _HAS_SHERPA:
             return
 
-        print(f"[TTS] 需合成 {len(need_synth)} 个...")
-        synth_count = 0
-        for phrase in need_synth:
-            try:
-                audio = self._do_synthesize(phrase)
-                if audio is not None:
-                    with self._cache_lock:
-                        self._cache[phrase] = audio
-                    self._save_to_disk(phrase, audio)
-                    synth_count += 1
-            except Exception as e:
-                print(f"[TTS] 预缓存失败 '{phrase}': {e}")
+        cfg = LOCAL_MODELS.get(self.local_model)
+        if cfg is None:
+            return
 
-        with self._cache_lock:
-            cached = len([v for v in self._cache.values() if v is not None])
-        print(f"[TTS] 预缓存完成: {cached}/{len(phrases)} 个")
+        model_dir = os.path.join(self._models_dir, cfg["dir"])
+        if not os.path.isdir(model_dir):
+            return
 
-    def get_cached(self, text: str) -> Optional[np.ndarray]:
-        """查找缓存，命中返回音频，未命中返回None"""
-        with self._cache_lock:
-            return self._cache.get(text)
+        try:
+            if cfg["type"] == "matcha":
+                config = sherpa_onnx.OfflineTtsConfig(
+                    model=sherpa_onnx.OfflineTtsModelConfig(
+                        matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
+                            acoustic_model=os.path.join(model_dir, cfg["acoustic_model"]),
+                            vocoder=os.path.join(model_dir, cfg["vocoder"]),
+                            lexicon=os.path.join(model_dir, cfg["lexicon"]),
+                            tokens=os.path.join(model_dir, cfg["tokens"]),
+                            dict_dir=os.path.join(model_dir, cfg.get("dict_dir", "")),
+                            length_scale=1.0,
+                        ),
+                        num_threads=4,
+                    ),
+                )
+            else:
+                return
 
-    def _do_synthesize(self, text: str, sid: int = 0) -> Optional[np.ndarray]:
-        """底层合成调用"""
-        if self._tts is None:
+            self._local_tts = sherpa_onnx.OfflineTts(config)
+            self._local_sr = self._local_tts.sample_rate
+            print(f"[TTS] 本地备选已加载: {cfg['description']}")
+        except Exception as e:
+            print(f"[TTS] 本地模型加载失败: {e}")
+
+    def _local_synthesize(self, text: str) -> Optional[np.ndarray]:
+        """本地合成，返回 float32 numpy (重采样到 OUTPUT_SR)"""
+        if self._local_tts is None:
+            self._init_local()
+        if self._local_tts is None:
             return None
         try:
-            audio = self._tts.generate(text, sid=sid, speed=self.speed)
+            audio = self._local_tts.generate(text, sid=0, speed=1.0)
             if audio and audio.samples:
-                return np.array(audio.samples, dtype=np.float32)
+                samples = np.array(audio.samples, dtype=np.float32)
+                if self._local_sr != self.OUTPUT_SR:
+                    from audio_io import fast_resample
+                    samples = fast_resample(samples, self._local_sr, self.OUTPUT_SR)
+                return samples
         except Exception as e:
             print(f"[TTS] 本地合成错误: {e}")
         return None
 
-    def synthesize(self, text: str, retries: int = 2) -> Optional[np.ndarray]:
-        """合成语音，返回 numpy 音频数组 (float32)"""
-        # 先查缓存
-        cached = self.get_cached(text)
-        if cached is not None:
-            return cached.copy()
-
-        for attempt in range(retries):
-            audio = self._do_synthesize(text)
-            if audio is not None and len(audio) > 0:
-                # 缓存合成结果
-                with self._cache_lock:
-                    if len(self._cache) < 200:
-                        self._cache[text] = audio
-                return audio
-            print(f"[TTS] 第{attempt+1}次合成失败，重试...")
-            time.sleep(0.1)
-
-        print(f"[TTS] 本地合成失败，尝试 SAPI 保底: {text[:30]}")
-        return self._fallback_sapi(text)
-
-    def synthesize_to_file(self, text: str, output_path: str) -> bool:
-        """合成语音到文件 (WAV)"""
-        try:
-            audio = self.synthesize(text)
-            if audio is not None:
-                import wave
-                with wave.open(output_path, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(self.sample_rate)
-                    wf.writeframes((audio * 32767).astype(np.int16).tobytes())
-                return True
-        except Exception as e:
-            print(f"[TTS] 合成到文件错误: {e}")
-        return False
+    # ==================== SAPI 保底 ====================
 
     def _fallback_sapi(self, text: str) -> Optional[np.ndarray]:
-        """Windows SAPI 保底 TTS，无需网络"""
-        target_sr = self.sample_rate
-        tmp_wav = None
-        tmp_ps1 = None
+        """Windows SAPI 保底"""
+        tmp_wav = tmp_ps1 = None
         try:
             tmp_fd, tmp_wav = tempfile.mkstemp(suffix='.wav')
             os.close(tmp_fd)
             tmp_ps1 = tmp_wav.replace('.wav', '.ps1')
             safe_text = text.replace('"', "'").replace('\n', ' ')
             with open(tmp_ps1, 'w', encoding='utf-8-sig') as f:
-                f.write(f'Add-Type -AssemblyName System.Speech\n')
-                f.write(f'$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer\n')
-                f.write(f'$synth.Rate = 2\n')
+                f.write('Add-Type -AssemblyName System.Speech\n')
+                f.write('$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer\n')
+                f.write('$synth.Rate = 2\n')
                 f.write(f'$synth.SetOutputToWaveFile("{tmp_wav}")\n')
                 f.write(f'$synth.Speak("{safe_text}")\n')
-                f.write(f'$synth.Dispose()\n')
+                f.write('$synth.Dispose()\n')
             result = subprocess.run(
                 ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', tmp_ps1],
                 capture_output=True, timeout=15
             )
             if result.returncode != 0:
-                stderr = result.stderr.decode('utf-8', errors='ignore')[:100]
-                print(f"[TTS-SAPI] PowerShell 错误: {stderr}")
                 return None
             if not os.path.exists(tmp_wav) or os.path.getsize(tmp_wav) < 100:
-                print("[TTS-SAPI] WAV 文件无效")
                 return None
-            audio = self._decode_wav(tmp_wav, target_sr)
-            if audio is not None:
-                print(f"[TTS-SAPI] 保底合成OK: {len(audio)} samples")
-            return audio
+            return self._decode_wav(tmp_wav, self.OUTPUT_SR)
         except Exception as e:
-            print(f"[TTS-SAPI] 保底合成失败: {e}")
+            print(f"[TTS-SAPI] 失败: {e}")
             return None
         finally:
             for f in (tmp_wav, tmp_ps1):
@@ -287,69 +276,134 @@ class TTSEngine:
 
     @staticmethod
     def _decode_wav(wav_path: str, target_sr: int = 24000) -> Optional[np.ndarray]:
-        """WAV 解码 + 重采样为 float32"""
+        """WAV → float32 numpy + 重采样"""
         try:
             import wave
             with wave.open(wav_path, 'rb') as wf:
-                n_channels = wf.getnchannels()
-                sample_width = wf.getsampwidth()
-                src_sr = wf.getframerate()
-                n_frames = wf.getnframes()
-                raw = wf.readframes(n_frames)
-
-            if sample_width == 2:
+                n_ch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                sr = wf.getframerate()
+                raw = wf.readframes(wf.getnframes())
+            if sw == 2:
                 samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            elif sample_width == 1:
-                samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            elif sw == 1:
+                samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128) / 128.0
             else:
                 return None
-
-            if n_channels > 1:
-                samples = samples[::n_channels]
-
-            if src_sr != target_sr:
-                duration = len(samples) / src_sr
-                target_len = int(duration * target_sr)
-                indices = np.linspace(0, len(samples) - 1, target_len)
-                samples = np.interp(indices, np.arange(len(samples)), samples).astype(np.float32)
-
+            if n_ch > 1:
+                samples = samples[::n_ch]
+            if sr != target_sr:
+                n = int(len(samples) / sr * target_sr)
+                samples = np.interp(
+                    np.linspace(0, len(samples)-1, n),
+                    np.arange(len(samples)), samples
+                ).astype(np.float32)
             return samples
-        except Exception as e:
-            print(f"[TTS-SAPI] WAV 解码错误: {e}")
+        except Exception:
             return None
 
+    # ==================== 统一合成接口 ====================
 
-if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, os.path.dirname(__file__))
-    import sounddevice as sd
-
-    print("=== TTS 引擎测试 (本地 Matcha-TTS) ===")
-    tts = TTSEngine(voice="matcha-zh-baker", speed=1.0)
-
-    texts = [
-        "你好，我是语音助手小乐，很高兴为你服务！",
-        "好的，我来帮你查一下天气。",
-        "今天北京晴，最高温度二十五度，适合出行。",
-        "好的，我来处理一下。",
-    ]
-
-    for text in texts:
-        t0 = time.time()
-        audio = tts.synthesize(text)
-        elapsed = time.time() - t0
-        if audio is not None:
-            duration = len(audio) / tts.sample_rate
-            print(f"{text}")
-            print(f"  合成 {elapsed:.3f}s → 时长 {duration:.2f}s (RTF={elapsed/duration:.3f})")
-            sd.play(audio, samplerate=tts.sample_rate)
-            sd.wait()
-            time.sleep(0.3)
+    def _do_synthesize(self, text: str) -> Optional[np.ndarray]:
+        """按优先级尝试各引擎合成"""
+        if self.engine == "edge":
+            # edge-tts 优先 → 本地备选 → SAPI
+            audio = self._edge_synthesize(text)
+            if audio is not None:
+                return audio
+            audio = self._local_synthesize(text)
+            if audio is not None:
+                return audio
         else:
-            print(f"  合成失败: {text}")
+            # 本地优先
+            audio = self._local_synthesize(text)
+            if audio is not None:
+                return audio
 
-    print("\n=== 预缓存测试 ===")
-    tts.precache()
-    t0 = time.time()
-    audio = tts.synthesize("好的，我来查一下")
-    print(f"缓存命中: {time.time()-t0:.4f}s")
+        return self._fallback_sapi(text)
+
+    # ==================== 缓存 ====================
+
+    def _cache_key(self, text: str) -> str:
+        key = f"{self.engine}_{self.voice}_{self.rate}_{text}"
+        return hashlib.md5(key.encode('utf-8')).hexdigest()
+
+    def _cache_file(self, text: str) -> str:
+        return os.path.join(self.CACHE_DIR, f"{self._cache_key(text)}.npy")
+
+    def _load_from_disk(self, text: str) -> Optional[np.ndarray]:
+        path = self._cache_file(text)
+        if os.path.exists(path):
+            try:
+                return np.load(path)
+            except Exception:
+                pass
+        return None
+
+    def _save_to_disk(self, text: str, audio: np.ndarray):
+        try:
+            np.save(self._cache_file(text), audio)
+        except Exception:
+            pass
+
+    def get_cached(self, text: str) -> Optional[np.ndarray]:
+        with self._cache_lock:
+            return self._cache.get(text)
+
+    # ==================== 公开 API ====================
+
+    def synthesize(self, text: str, retries: int = 2) -> Optional[np.ndarray]:
+        """合成语音，返回 float32 numpy (24kHz)"""
+        cached = self.get_cached(text)
+        if cached is not None:
+            return cached.copy()
+
+        for attempt in range(retries):
+            audio = self._do_synthesize(text)
+            if audio is not None and len(audio) > 0:
+                with self._cache_lock:
+                    if len(self._cache) < 200:
+                        self._cache[text] = audio
+                return audio
+            if attempt < retries - 1:
+                time.sleep(0.1)
+
+        return None
+
+    def precache(self, phrases: list[str] = None):
+        """预缓存常用短语"""
+        phrases = phrases or self.PRECACHE_PHRASES
+        print(f"[TTS] 预缓存 {len(phrases)} 个常用短语...")
+
+        need_synth = []
+        disk_loaded = 0
+        for phrase in phrases:
+            audio = self._load_from_disk(phrase)
+            if audio is not None:
+                with self._cache_lock:
+                    self._cache[phrase] = audio
+                disk_loaded += 1
+            else:
+                need_synth.append(phrase)
+
+        if disk_loaded:
+            print(f"[TTS] 从磁盘加载 {disk_loaded} 个")
+
+        if not need_synth:
+            print(f"[TTS] 预缓存完成: {disk_loaded}/{len(phrases)} 个(全部命中磁盘)")
+            return
+
+        print(f"[TTS] 需合成 {len(need_synth)} 个...")
+        for phrase in need_synth:
+            try:
+                audio = self._do_synthesize(phrase)
+                if audio is not None:
+                    with self._cache_lock:
+                        self._cache[phrase] = audio
+                    self._save_to_disk(phrase, audio)
+            except Exception as e:
+                print(f"[TTS] 预缓存失败 '{phrase}': {e}")
+
+        with self._cache_lock:
+            cached = sum(1 for v in self._cache.values() if v is not None)
+        print(f"[TTS] 预缓存完成: {cached}/{len(phrases)} 个")

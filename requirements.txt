@@ -7,5 +7,7 @@ soxr>=0.3
 # ASR
 sherpa-onnx>=1.10
 
-# TTS (sherpa-onnx 本地推理, 与 ASR 共用)
-# edge-tts/miniaudio 保留作为可选依赖
+# TTS
+edge-tts>=6.1
+miniaudio>=1.59
+# sherpa-onnx 已在 ASR 中引入，同时提供本地 TTS 备选

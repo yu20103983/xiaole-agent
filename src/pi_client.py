@@ -3,6 +3,7 @@ Pi Agent RPC 客户端
 通过 stdin/stdout JSON 协议与 pi --mode rpc 通信
 """
 
+import os
 import subprocess
 import json
 import threading
@@ -44,19 +45,18 @@ class PiClient:
 
     def _start_process(self):
         """内部方法：启动 pi RPC 子进程"""
-        import os as _os
         # 先清理旧进程
         self._cleanup_proc()
         # 优先用项目本地的 pi
-        local_pi = _os.path.join(self.working_dir, "node_modules", ".bin", "pi.cmd")
-        if not _os.path.exists(local_pi):
-            local_pi = _os.path.join(self.working_dir, "node_modules", ".bin", "pi")
-        if not _os.path.exists(local_pi):
+        local_pi = os.path.join(self.working_dir, "node_modules", ".bin", "pi.cmd")
+        if not os.path.exists(local_pi):
+            local_pi = os.path.join(self.working_dir, "node_modules", ".bin", "pi")
+        if not os.path.exists(local_pi):
             import shutil
             local_pi = shutil.which("pi") or "pi"
         print(f"[PiClient] 使用: {local_pi}")
         # 继承当前环境变量（包含 API 代理配置）
-        env = _os.environ.copy()
+        env = os.environ.copy()
         self._proc = subprocess.Popen(
             [local_pi, "--mode", "rpc", "--no-session",
              "--provider", self.provider, "--model", self.model],
@@ -226,6 +226,10 @@ class PiClient:
                 else:
                     print(f"[PiClient] 已达最大重启次数，停止重试")
                     break
+
+    def wait_response(self, timeout: float = 10) -> bool:
+        """等待当前响应完成，返回是否在超时前完成"""
+        return self._response_event.wait(timeout=timeout)
 
     def save_steer(self, message: str):
         """保存 steer 消息，用于进程重启后恢复"""
