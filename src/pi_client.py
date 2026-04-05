@@ -14,12 +14,17 @@ class PiClient:
     """Pi Agent RPC 客户端"""
 
     def __init__(self, working_dir: str = ".",
-                 provider: str = "claude-proxy", model: str = "claude-opus-4-6"):
+                 provider: str = "claude-proxy", model: str = "claude-opus-4-6",
+                 auto_restart: bool = True, max_restarts: int = 3):
         self.working_dir = working_dir
         self.provider = provider
         self.model = model
+        self.auto_restart = auto_restart
+        self.max_restarts = max_restarts
+        self._restart_count = 0
         self._proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
+        self._health_thread: Optional[threading.Thread] = None
         self._running = False
         self._on_text_delta: Optional[Callable[[str], None]] = None
         self._on_response_complete: Optional[Callable[[str], None]] = None
@@ -27,6 +32,7 @@ class PiClient:
         self._current_response = ""
         self._response_event = threading.Event()
         self._lock = threading.Lock()
+        self._steer_message: Optional[str] = None  # 保存system prompt用于重启后恢复
 
     def start(self):
         """启动 pi RPC 进程（使用项目本地 node_modules 中的 pi）"""
@@ -56,6 +62,10 @@ class PiClient:
         self._running = True
         self._reader_thread = threading.Thread(target=self._read_events, daemon=True)
         self._reader_thread.start()
+        # 启动健康检查线程
+        if self.auto_restart:
+            self._health_thread = threading.Thread(target=self._health_check, daemon=True)
+            self._health_thread.start()
         time.sleep(1)  # 等待 pi 启动
         print("[PiClient] Pi Agent RPC 已启动")
 
@@ -67,24 +77,22 @@ class PiClient:
             self._proc.stdin.flush()
 
     def _read_events(self):
-        """持续读取 pi 输出的事件"""
-        buffer = ""
+        """持续读取 pi 输出的事件（按行读取，高效）"""
         while self._running and self._proc:
             try:
-                raw = self._proc.stdout.read(1)
-                if not raw:
+                line = self._proc.stdout.readline()
+                if not line:
+                    if self._running:
+                        print("[PiClient] Pi 进程输出流已关闭")
                     break
-                buffer += raw
-                if raw == '\n':
-                    line = buffer.strip()
-                    buffer = ""
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                        self._handle_event(event)
-                    except json.JSONDecodeError:
-                        pass
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    self._handle_event(event)
+                except json.JSONDecodeError:
+                    pass
             except Exception as e:
                 if self._running:
                     print(f"[PiClient] 读取错误: {e}")
@@ -152,6 +160,37 @@ class PiClient:
     def abort(self):
         """中止当前操作"""
         self._send({"type": "abort"})
+
+    def _health_check(self):
+        """定期检查 Pi 进程是否存活，崩溃时自动重启"""
+        while self._running:
+            time.sleep(3)
+            if not self._running:
+                break
+            if self._proc and self._proc.poll() is not None:
+                exit_code = self._proc.poll()
+                print(f"[PiClient] Pi 进程已退出 (code={exit_code})")
+                if self._restart_count < self.max_restarts:
+                    self._restart_count += 1
+                    print(f"[PiClient] 自动重启 ({self._restart_count}/{self.max_restarts})...")
+                    try:
+                        self._proc = None
+                        time.sleep(1)
+                        self.start()
+                        # 重启后恢复 system prompt
+                        if self._steer_message:
+                            time.sleep(0.5)
+                            self._send({"type": "steer", "message": self._steer_message})
+                        print(f"[PiClient] 重启成功")
+                    except Exception as e:
+                        print(f"[PiClient] 重启失败: {e}")
+                else:
+                    print(f"[PiClient] 已达最大重启次数，停止重试")
+                    break
+
+    def save_steer(self, message: str):
+        """保存 steer 消息，用于进程重启后恢复"""
+        self._steer_message = message
 
     def stop(self):
         """停止 pi 进程"""

@@ -36,6 +36,8 @@ class ASREngine:
         self._silence_after_speech = 0  # 语音后的静音帧数
         # 异步队列：解耦音频回调和识别线程
         self._audio_queue: deque = deque(maxlen=500)  # 环形缓冲区，防止内存爆炸
+        self._dropped_chunks = 0  # 丢弃的音频块计数
+        self._last_drop_warn = 0  # 上次告警时间
         self._queue_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         self._running = False
@@ -91,6 +93,12 @@ class ASREngine:
         仅入队列，不阻塞音频回调线程"""
         if self.vad is None or self.recognizer is None:
             return
+        if len(self._audio_queue) >= self._audio_queue.maxlen:
+            self._dropped_chunks += 1
+            now = time.time()
+            if now - self._last_drop_warn > 5:  # 每5秒最多警告一次
+                print(f"[ASR] 警告: 音频队列已满，已丢弃 {self._dropped_chunks} 个音频块")
+                self._last_drop_warn = now
         self._audio_queue.append(samples)
         self._queue_event.set()
 
@@ -159,6 +167,7 @@ class ASREngine:
             self._speech_buffer.clear()
         # 清空队列中未处理的音频
         self._audio_queue.clear()
+        self._dropped_chunks = 0
 
     def stop(self):
         """停止异步识别线程"""

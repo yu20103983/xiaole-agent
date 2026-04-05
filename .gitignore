@@ -1,11 +1,9 @@
-node_modules/
 __pycache__/
 *.pyc
 *.pyo
-models/
-test_beep.wav
+node_modules/
 *.wav
 *.mp3
-.pi/
-nul
+models/
 bin/
+.env

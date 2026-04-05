@@ -82,7 +82,7 @@ def find_bluetooth_devices(keyword: str = "漫步者") -> tuple[Optional[int], O
     return input_id, output_id, info
 
 
-def auto_detect_devices(prefer_local_input: bool = False) -> dict:
+def auto_detect_devices(prefer_local_input: bool = False, prefer_local: bool = False) -> dict:
     """自动检测最佳音频输入/输出设备
 
     策略（按优先级）：
@@ -156,6 +156,11 @@ def auto_detect_devices(prefer_local_input: bool = False) -> dict:
     bt_stereo_outputs.sort(key=lambda x: x[4])
     local_inputs.sort(key=lambda x: (x[4], x[3]))   # 先按设备类型优先级，再按API优先级
     local_outputs.sort(key=lambda x: (x[4], x[3]))
+
+    # prefer_local: 跳过蓝牙，直接用本地设备
+    if prefer_local:
+        bt_hfp_inputs.clear()
+        bt_stereo_outputs.clear()
 
     result = {}
 

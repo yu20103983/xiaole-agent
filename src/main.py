@@ -27,7 +27,8 @@ def _init_audio_devices():
     if A2DP_ID is not None and HFP_IN is not None:
         print(f"[Audio] 使用配置: 输入=#{HFP_IN}({HFP_IN_SR}Hz) 输出=#{A2DP_ID}({A2DP_SR}Hz)")
         return
-    det = auto_detect_devices()
+    prefer = getattr(__import__('config'), 'PREFER_LOCAL', False)
+    det = auto_detect_devices(prefer_local=prefer)
     _init_audio_devices._det = det  # 保存检测结果供双工检测用
     if HFP_IN is None:
         HFP_IN = det['input_id']
@@ -539,6 +540,7 @@ def main():
     pi.start()
     print("[Init] 系统提示词...", flush=True)
     pi._send({"type": "steer", "message": SYSTEM_PROMPT})
+    pi.save_steer(SYSTEM_PROMPT)
     time.sleep(0.5)
     print("[Init] ✅ 就绪\n", flush=True)
 
