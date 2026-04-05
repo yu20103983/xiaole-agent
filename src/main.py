@@ -11,12 +11,29 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import sounddevice as sd
 from scipy.signal import resample as scipy_resample
-from audio_io import AudioRecorder
+from audio_io import AudioRecorder, auto_detect_devices
 from asr_engine import ASREngine
 from tts_engine import TTSEngine
 from pi_client import PiClient
 from session_controller import SessionController, SessionState
 from config import *
+
+# ============ 设备自动检测 ============
+def _init_audio_devices():
+    """ 自动检测音频设备，配置中为 None 的项自动填充"""
+    global A2DP_ID, A2DP_SR, HFP_IN, HFP_IN_SR
+    if A2DP_ID is not None and HFP_IN is not None:
+        print(f"[Audio] 使用配置: 输入=#{HFP_IN}({HFP_IN_SR}Hz) 输出=#{A2DP_ID}({A2DP_SR}Hz)")
+        return
+    det = auto_detect_devices()
+    if HFP_IN is None:
+        HFP_IN = det['input_id']
+        HFP_IN_SR = det['input_sr']
+    if A2DP_ID is None:
+        A2DP_ID = det['output_id']
+        A2DP_SR = det['output_sr']
+
+_init_audio_devices()
 
 SYSTEM_PROMPT = """你是"小乐"，通过蓝牙耳机与用户语音对话的个人助理。
 

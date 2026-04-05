@@ -3,10 +3,11 @@
 """
 
 # ============ 音频设备 ============
-A2DP_ID = 11              # A2DP 输出设备 ID
-A2DP_SR = 44100           # A2DP 采样率
-HFP_IN = 9               # HFP 输入设备 ID
-HFP_IN_SR = 44100        # HFP 输入采样率
+# 设为 None 时自动检测蓝牙/本地设备
+A2DP_ID = None            # A2DP 输出设备 ID (None=自动)
+A2DP_SR = None            # A2DP 采样率 (None=自动)
+HFP_IN = None             # HFP 输入设备 ID (None=自动)
+HFP_IN_SR = None          # HFP 输入采样率 (None=自动)
 
 # ============ TTS ============
 TTS_VOICE = "xiaoxiao"    # TTS 语音：xiaoxiao/yunxi/xiaoyi/yunjian

@@ -26,11 +26,7 @@ def list_devices():
 
 
 def find_bluetooth_devices(keyword: str = "漫步者") -> tuple[Optional[int], Optional[int], dict]:
-    """查找蓝牙耳机的 HFP 输入/输出设备 (优先 DirectSound)
-
-    返回 (input_id, output_id, info)
-    info 包含 input_name, output_name, input_sr, output_sr
-    """
+    """(旧接口) 按关键词查找蓝牙设备"""
     devices = sd.query_devices()
     input_id = None
     output_id = None
@@ -67,6 +63,158 @@ def find_bluetooth_devices(keyword: str = "漫步者") -> tuple[Optional[int], O
             break
 
     return input_id, output_id, info
+
+
+def auto_detect_devices() -> dict:
+    """自动检测最佳音频输入/输出设备
+
+    策略（按优先级）：
+      1. 蓝牙一体设备：同一蓝牙设备的 HFP 输入 + A2DP Stereo 输出
+      2. 蓝牙分体：任意蓝牙 HFP 输入 + 任意蓝牙 A2DP 输出
+      3. 蓝牙+本地混合：蓝牙 HFP 输入 + 本地扬声器输出（或反之）
+      4. 纯本地：系统默认输入 + 默认输出
+
+    API 优先级：DirectSound > MME > WASAPI
+
+    返回 dict:
+      input_id, input_sr, input_name, input_api,
+      output_id, output_sr, output_name, output_api,
+      bt_name (蓝牙设备名, 无蓝牙时为 None),
+      mode ('bt_unified' | 'bt_split' | 'bt_mixed' | 'local')
+    """
+    devices = sd.query_devices()
+    api_priority = {'Windows DirectSound': 0, 'DirectSound': 0,
+                    'MME': 1, 'Windows WASAPI': 2, 'WASAPI': 2}
+
+    # ---- 扫描所有设备，分类 ----
+    bt_hfp_inputs = []   # (idx, dev, api_name, bt_name, priority)
+    bt_stereo_outputs = []  # (idx, dev, api_name, bt_name, priority)
+    local_inputs = []    # (idx, dev, api_name, priority)
+    local_outputs = []   # (idx, dev, api_name, priority)
+
+    for i, d in enumerate(devices):
+        name = d['name']
+        hostapi = sd.query_hostapis(d['hostapi'])['name']
+        pri = api_priority.get(hostapi, 9)
+
+        # 跳过 WDM-KS（底层驱动接口，不稳定）
+        if 'WDM' in hostapi:
+            continue
+
+        is_bt_hfp = 'Hands-Free' in name or 'hands-free' in name.lower()
+        is_bt_stereo = 'Stereo' in name or 'stereo' in name.lower()
+        is_bt = is_bt_hfp or is_bt_stereo
+
+        # 提取蓝牙设备名（去掉 Hands-Free/Stereo 后缀和前缀装饰）
+        bt_name = None
+        if is_bt:
+            import re as _re
+            # 提取括号内的名称
+            m = _re.search(r'[（(](.+?)[）)]', name)
+            raw = m.group(1) if m else name
+            # 去掉 Hands-Free/Stereo/AG Audio 等后缀
+            raw = _re.sub(r'\s*(Hands-Free|Stereo|AG Audio|HF Audio).*', '', raw, flags=_re.IGNORECASE)
+            bt_name = raw.strip()
+
+        if is_bt_hfp and d['max_input_channels'] > 0:
+            bt_hfp_inputs.append((i, d, hostapi, bt_name, pri))
+        elif is_bt_stereo and d['max_output_channels'] > 0:
+            bt_stereo_outputs.append((i, d, hostapi, bt_name, pri))
+        elif not is_bt:
+            if d['max_input_channels'] > 0:
+                # 排除 Mapper/主声音 等虚拟设备
+                if 'Mapper' not in name and '主声音' not in name:
+                    local_inputs.append((i, d, hostapi, pri))
+            if d['max_output_channels'] > 0:
+                if 'Mapper' not in name and '主声音' not in name:
+                    local_outputs.append((i, d, hostapi, pri))
+
+    # 按 API 优先级排序
+    bt_hfp_inputs.sort(key=lambda x: x[4])
+    bt_stereo_outputs.sort(key=lambda x: x[4])
+    local_inputs.sort(key=lambda x: x[3])
+    local_outputs.sort(key=lambda x: x[3])
+
+    result = {}
+
+    def _set_input(idx, dev, api):
+        result['input_id'] = idx
+        result['input_sr'] = int(dev['default_samplerate'])
+        result['input_name'] = dev['name']
+        result['input_api'] = api
+
+    def _set_output(idx, dev, api):
+        result['output_id'] = idx
+        result['output_sr'] = int(dev['default_samplerate'])
+        result['output_name'] = dev['name']
+        result['output_api'] = api
+
+    # ---- 策略1: 蓝牙一体（同名设备的 HFP 输入 + Stereo 输出）----
+    for hi, hd, hapi, hbt, _ in bt_hfp_inputs:
+        for si, sd_dev, sapi, sbt, _ in bt_stereo_outputs:
+            if hbt and sbt and hbt == sbt:
+                _set_input(hi, hd, hapi)
+                _set_output(si, sd_dev, sapi)
+                result['bt_name'] = hbt
+                result['mode'] = 'bt_unified'
+                print(f"[Audio] 蓝牙一体设备: {hbt}")
+                print(f"  输入: #{hi} [{hapi}] {hd['name']} ({result['input_sr']}Hz)")
+                print(f"  输出: #{si} [{sapi}] {sd_dev['name']} ({result['output_sr']}Hz)")
+                return result
+
+    # ---- 策略2: 蓝牙分体（不同蓝牙设备的 HFP + Stereo）----
+    if bt_hfp_inputs and bt_stereo_outputs:
+        hi, hd, hapi, hbt, _ = bt_hfp_inputs[0]
+        si, sd_dev, sapi, sbt, _ = bt_stereo_outputs[0]
+        _set_input(hi, hd, hapi)
+        _set_output(si, sd_dev, sapi)
+        result['bt_name'] = f"{hbt} + {sbt}"
+        result['mode'] = 'bt_split'
+        print(f"[Audio] 蓝牙分体: 输入={hbt}, 输出={sbt}")
+        print(f"  输入: #{hi} [{hapi}] {hd['name']} ({result['input_sr']}Hz)")
+        print(f"  输出: #{si} [{sapi}] {sd_dev['name']} ({result['output_sr']}Hz)")
+        return result
+
+    # ---- 策略3: 蓝牙+本地混合 ----
+    if bt_hfp_inputs and local_outputs:
+        hi, hd, hapi, hbt, _ = bt_hfp_inputs[0]
+        li, ld, lapi, _ = local_outputs[0]
+        _set_input(hi, hd, hapi)
+        _set_output(li, ld, lapi)
+        result['bt_name'] = hbt
+        result['mode'] = 'bt_mixed'
+        print(f"[Audio] 混合: 蓝牙输入={hbt}, 本地输出")
+        print(f"  输入: #{hi} [{hapi}] {hd['name']} ({result['input_sr']}Hz)")
+        print(f"  输出: #{li} [{lapi}] {ld['name']} ({result['output_sr']}Hz)")
+        return result
+
+    if bt_stereo_outputs and local_inputs:
+        li, ld, lapi, _ = local_inputs[0]
+        si, sd_dev, sapi, sbt, _ = bt_stereo_outputs[0]
+        _set_input(li, ld, lapi)
+        _set_output(si, sd_dev, sapi)
+        result['bt_name'] = sbt
+        result['mode'] = 'bt_mixed'
+        print(f"[Audio] 混合: 本地输入, 蓝牙输出={sbt}")
+        print(f"  输入: #{li} [{lapi}] {ld['name']} ({result['input_sr']}Hz)")
+        print(f"  输出: #{si} [{sapi}] {sd_dev['name']} ({result['output_sr']}Hz)")
+        return result
+
+    # ---- 策略4: 纯本地 ----
+    if local_inputs and local_outputs:
+        li, ld, lapi, _ = local_inputs[0]
+        lo, lod, loapi, _ = local_outputs[0]
+        _set_input(li, ld, lapi)
+        _set_output(lo, lod, loapi)
+        result['bt_name'] = None
+        result['mode'] = 'local'
+        print(f"[Audio] 本地设备（未检测到蓝牙）")
+        print(f"  输入: #{li} [{lapi}] {ld['name']} ({result['input_sr']}Hz)")
+        print(f"  输出: #{lo} [{loapi}] {lod['name']} ({result['output_sr']}Hz)")
+        return result
+
+    # ---- 无设备 ----
+    raise RuntimeError("未检测到任何可用音频输入/输出设备")
 
 
 class HFPKeepAlive:
