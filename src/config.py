@@ -19,9 +19,11 @@ TTS_RATE = "+10%"         # TTS 语速
 # ============ 播放管线 ============
 MAX_MERGE_CLAUSES = 2     # 最多合并逗号短句数（提升语气连贯性）
 INPUT_SILENCE_TIMEOUT = 5.0  # 静音超时后发送指令（秒）
+CONTINUOUS_INPUT_SILENCE_TIMEOUT = 3.0  # 连续对话模式下的静音超时（秒）
 
 # ============ 会话 ============
 AUTO_SLEEP_TIMEOUT = 0    # 无活动自动休眠秒数 (0=禁用)
+CONTINUOUS_SILENCE_TIMEOUT = 30  # 连续对话模式：用户沉默超时秒数，超时后自动退出
 
 # ============ Agent ============
 PI_WORKING_DIR = "."      # Pi Agent 工作目录

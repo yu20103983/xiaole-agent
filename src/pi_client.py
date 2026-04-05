@@ -36,7 +36,17 @@ class PiClient:
 
     def start(self):
         """启动 pi RPC 进程（使用项目本地 node_modules 中的 pi）"""
+        self._start_process()
+        # 只在首次启动时创建健康检查线程
+        if self.auto_restart and (self._health_thread is None or not self._health_thread.is_alive()):
+            self._health_thread = threading.Thread(target=self._health_check, daemon=True)
+            self._health_thread.start()
+
+    def _start_process(self):
+        """内部方法：启动 pi RPC 子进程"""
         import os as _os
+        # 先清理旧进程
+        self._cleanup_proc()
         # 优先用项目本地的 pi
         local_pi = _os.path.join(self.working_dir, "node_modules", ".bin", "pi.cmd")
         if not _os.path.exists(local_pi):
@@ -62,19 +72,49 @@ class PiClient:
         self._running = True
         self._reader_thread = threading.Thread(target=self._read_events, daemon=True)
         self._reader_thread.start()
-        # 启动健康检查线程
-        if self.auto_restart:
-            self._health_thread = threading.Thread(target=self._health_check, daemon=True)
-            self._health_thread.start()
         time.sleep(1)  # 等待 pi 启动
         print("[PiClient] Pi Agent RPC 已启动")
 
+    def _cleanup_proc(self):
+        """安全清理旧的子进程及其管道"""
+        old_proc = self._proc
+        self._proc = None
+        if old_proc is None:
+            return
+        try:
+            if old_proc.stdin:
+                old_proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            if old_proc.stdout:
+                old_proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            if old_proc.stderr:
+                old_proc.stderr.close()
+        except Exception:
+            pass
+        try:
+            old_proc.terminate()
+            old_proc.wait(timeout=3)
+        except Exception:
+            try:
+                old_proc.kill()
+            except Exception:
+                pass
+
     def _send(self, cmd: dict):
         """发送命令到 pi"""
-        if self._proc and self._proc.stdin:
-            line = json.dumps(cmd, ensure_ascii=False) + "\n"
-            self._proc.stdin.write(line)
-            self._proc.stdin.flush()
+        proc = self._proc
+        if proc and proc.stdin and proc.poll() is None:
+            try:
+                line = json.dumps(cmd, ensure_ascii=False) + "\n"
+                proc.stdin.write(line)
+                proc.stdin.flush()
+            except OSError as e:
+                print(f"[PiClient] 发送失败: {e}")
 
     def _read_events(self):
         """持续读取 pi 输出的事件（按行读取，高效）"""
@@ -174,13 +214,12 @@ class PiClient:
                     self._restart_count += 1
                     print(f"[PiClient] 自动重启 ({self._restart_count}/{self.max_restarts})...")
                     try:
-                        self._proc = None
-                        time.sleep(1)
-                        self.start()
+                        self._start_process()
                         # 重启后恢复 system prompt
                         if self._steer_message:
                             time.sleep(0.5)
                             self._send({"type": "steer", "message": self._steer_message})
+                        self._restart_count = 0  # 重启成功，重置计数
                         print(f"[PiClient] 重启成功")
                     except Exception as e:
                         print(f"[PiClient] 重启失败: {e}")
@@ -195,13 +234,7 @@ class PiClient:
     def stop(self):
         """停止 pi 进程"""
         self._running = False
-        if self._proc:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-            self._proc = None
+        self._cleanup_proc()
         print("[PiClient] Pi Agent RPC 已停止")
 
     @property

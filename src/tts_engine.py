@@ -10,6 +10,9 @@ import miniaudio
 import threading
 import queue
 import os
+import subprocess
+import tempfile
+import struct
 from typing import Optional
 
 
@@ -173,8 +176,8 @@ class TTSEngine:
                 if 'connect' in str(e).lower() or 'timeout' in str(e).lower():
                     print(f"[TTS] 网络连接异常，请检查网络")
             _time.sleep(0.3 * (attempt + 1))  # 递增等待
-        print(f"[TTS] 合成失败，已重试{retries}次: {text[:30]}")
-        return None
+        print(f"[TTS] edge-tts 合成失败，已重试{retries}次，尝试本地 SAPI: {text[:30]}")
+        return self._fallback_sapi(text)
 
     def synthesize_to_file(self, text: str, output_path: str) -> bool:
         """合成语音到文件"""
@@ -222,6 +225,85 @@ class TTSEngine:
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
         return t
+
+    def _fallback_sapi(self, text: str, sample_rate: int = 24000) -> Optional[np.ndarray]:
+        """Windows SAPI 保底 TTS，无需网络"""
+        tmp_wav = None
+        tmp_ps1 = None
+        try:
+            tmp_fd, tmp_wav = tempfile.mkstemp(suffix='.wav')
+            os.close(tmp_fd)
+            # 写 PowerShell 脚本文件，避免命令行转义问题
+            tmp_ps1 = tmp_wav.replace('.wav', '.ps1')
+            safe_text = text.replace('"', "'").replace('\n', ' ')
+            with open(tmp_ps1, 'w', encoding='utf-8-sig') as f:
+                f.write(f'Add-Type -AssemblyName System.Speech\n')
+                f.write(f'$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer\n')
+                f.write(f'$synth.Rate = 2\n')
+                f.write(f'$synth.SetOutputToWaveFile("{tmp_wav}")\n')
+                f.write(f'$synth.Speak("{safe_text}")\n')
+                f.write(f'$synth.Dispose()\n')
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', tmp_ps1],
+                capture_output=True, timeout=15
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode('utf-8', errors='ignore')[:100]
+                print(f"[TTS-SAPI] PowerShell 错误: {stderr}")
+                return None
+            if not os.path.exists(tmp_wav) or os.path.getsize(tmp_wav) < 100:
+                print("[TTS-SAPI] WAV 文件无效")
+                return None
+            audio = self._decode_wav(tmp_wav, sample_rate)
+            if audio is not None:
+                print(f"[TTS-SAPI] 保底合成OK: {len(audio)} samples")
+            return audio
+        except Exception as e:
+            print(f"[TTS-SAPI] 保底合成失败: {e}")
+            return None
+        finally:
+            for f in (tmp_wav, tmp_ps1):
+                if f and os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _decode_wav(wav_path: str, target_sr: int = 24000) -> Optional[np.ndarray]:
+        """WAV 解码 + 重采样为 float32"""
+        try:
+            import wave
+            with wave.open(wav_path, 'rb') as wf:
+                n_channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                src_sr = wf.getframerate()
+                n_frames = wf.getnframes()
+                raw = wf.readframes(n_frames)
+
+            # 转 float32
+            if sample_width == 2:
+                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sample_width == 1:
+                samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            else:
+                return None
+
+            # 取单声道
+            if n_channels > 1:
+                samples = samples[::n_channels]
+
+            # 重采样
+            if src_sr != target_sr:
+                duration = len(samples) / src_sr
+                target_len = int(duration * target_sr)
+                indices = np.linspace(0, len(samples) - 1, target_len)
+                samples = np.interp(indices, np.arange(len(samples)), samples).astype(np.float32)
+
+            return samples
+        except Exception as e:
+            print(f"[TTS-SAPI] WAV 解码错误: {e}")
+            return None
 
     @staticmethod
     def _decode_mp3(mp3_data: bytes, sample_rate: int = 24000) -> Optional[np.ndarray]:
