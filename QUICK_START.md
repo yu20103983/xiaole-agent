@@ -10,8 +10,8 @@
 ## 2. 一键安装
 
 ```bash
-git clone https://github.com/<your-username>/xiaole.git
-cd xiaole
+git clone https://github.com/<your-username>/xiaole-agent.git
+cd xiaole-agent
 setup.bat
 ```
 
