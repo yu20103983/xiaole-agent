@@ -12,7 +12,24 @@ import threading
 import queue
 import time
 from typing import Optional, Callable
-from scipy.signal import resample as scipy_resample
+
+try:
+    import soxr
+    def fast_resample(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
+        """使用 soxr 高性能重采样（比 scipy FFT 快 5-10 倍）"""
+        if from_sr == to_sr:
+            return audio
+        return soxr.resample(audio, from_sr, to_sr, quality='HQ').astype(np.float32)
+    print("[Audio] 使用 soxr 高性能重采样")
+except ImportError:
+    from scipy.signal import resample as scipy_resample
+    def fast_resample(audio: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
+        """回退到 scipy 重采样"""
+        if from_sr == to_sr:
+            return audio
+        target_len = int(len(audio) * to_sr / from_sr)
+        return scipy_resample(audio, target_len).astype(np.float32)
+    print("[Audio] soxr 未安装，回退到 scipy 重采样")
 
 
 def list_devices():
@@ -293,9 +310,7 @@ class AudioRecorder:
         audio = indata[:, 0].copy()
         # 重采样到目标采样率 (通常 44100 → 16000)
         if self.sample_rate != self.target_sr:
-            target_len = int(len(audio) * self.target_sr / self.sample_rate)
-            if target_len > 0:
-                audio = scipy_resample(audio, target_len).astype(np.float32)
+            audio = fast_resample(audio, self.sample_rate, self.target_sr)
         self.audio_queue.put(audio)
         if self._callback:
             self._callback(audio)
@@ -347,9 +362,7 @@ class AudioPlayer:
         sr = sample_rate or self.sample_rate
         # 重采样到设备采样率
         if sr != self.sample_rate:
-            audio_data = scipy_resample(
-                audio_data, int(len(audio_data) * self.sample_rate / sr)
-            ).astype(np.float32)
+            audio_data = fast_resample(audio_data, sr, self.sample_rate)
         self._playing = True
         try:
             sd.play(audio_data, samplerate=self.sample_rate, device=self.device_id)

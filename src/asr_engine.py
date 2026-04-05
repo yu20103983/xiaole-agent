@@ -18,7 +18,8 @@ VAD_MODEL = os.path.join(os.path.dirname(__file__), "..", "models", "silero_vad.
 
 
 class ASREngine:
-    """VAD + SenseVoice 离线语音识别引擎"""
+    """VAD + SenseVoice 离线语音识别引擎
+    音频数据通过队列异步送入，VAD + 识别在独立线程执行，不阻塞音频回调"""
 
     def __init__(self, model_dir: str = SENSEVOICE_DIR, vad_model: str = VAD_MODEL):
         self.model_dir = model_dir
@@ -33,6 +34,11 @@ class ASREngine:
         self._is_speaking = False
         self._speech_buffer = []
         self._silence_after_speech = 0  # 语音后的静音帧数
+        # 异步队列：解耦音频回调和识别线程
+        self._audio_queue: deque = deque(maxlen=500)  # 环形缓冲区，防止内存爆炸
+        self._queue_event = threading.Event()
+        self._worker_thread: Optional[threading.Thread] = None
+        self._running = False
 
     def init(self):
         """初始化 VAD + SenseVoice 识别器"""
@@ -69,6 +75,11 @@ class ASREngine:
         self.vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=60)
 
         print("[ASR] VAD + SenseVoice 引擎初始化完成")
+        # 启动异步识别线程
+        self._running = True
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+        print("[ASR] 异步识别线程已启动")
 
     def set_callbacks(self, on_partial: Optional[Callable[[str], None]] = None,
                       on_final: Optional[Callable[[str], None]] = None):
@@ -76,34 +87,59 @@ class ASREngine:
         self._on_final = on_final
 
     def feed_audio(self, samples: np.ndarray):
-        """输入音频数据（float32, 16kHz, mono）"""
+        """输入音频数据（float32, 16kHz, mono）
+        仅入队列，不阻塞音频回调线程"""
         if self.vad is None or self.recognizer is None:
             return
+        self._audio_queue.append(samples)
+        self._queue_event.set()
 
-        with self._lock:
-            # VAD 需要逐窗口送入
-            self.vad.accept_waveform(samples)
+    def _worker_loop(self):
+        """异步识别线程：从队列取音频 → VAD → SenseVoice 识别"""
+        while self._running:
+            # 等待新音频数据
+            self._queue_event.wait(timeout=0.5)
+            self._queue_event.clear()
 
-            # 检查是否有完整的语音段
-            while not self.vad.empty():
-                speech = self.vad.front
-                samples_array = np.array(speech.samples, dtype=np.float32)
+            # 批量取出队列中所有音频块
+            chunks = []
+            while self._audio_queue:
+                try:
+                    chunks.append(self._audio_queue.popleft())
+                except IndexError:
+                    break
 
-                # 用 SenseVoice 识别
-                stream = self.recognizer.create_stream()
-                stream.accept_waveform(16000, samples_array)
-                self.recognizer.decode_stream(stream)
-                text = stream.result.text.strip()
+            if not chunks:
+                continue
 
-                # 清理 SenseVoice 的特殊标记
-                text = self._clean_sensevoice_text(text)
+            # 拼接后送入 VAD + 识别
+            with self._lock:
+                for chunk in chunks:
+                    self._process_chunk(chunk)
 
-                if text:
-                    self._last_text = text
-                    if self._on_final:
-                        self._on_final(text)
+    def _process_chunk(self, samples: np.ndarray):
+        """处理一个音频块：VAD + 识别（在 worker 线程中调用，已持锁）"""
+        self.vad.accept_waveform(samples)
 
-                self.vad.pop()
+        while not self.vad.empty():
+            speech = self.vad.front
+            samples_array = np.array(speech.samples, dtype=np.float32)
+
+            # 用 SenseVoice 识别
+            stream = self.recognizer.create_stream()
+            stream.accept_waveform(16000, samples_array)
+            self.recognizer.decode_stream(stream)
+            text = stream.result.text.strip()
+
+            # 清理 SenseVoice 的特殊标记
+            text = self._clean_sensevoice_text(text)
+
+            if text:
+                self._last_text = text
+                if self._on_final:
+                    self._on_final(text)
+
+            self.vad.pop()
 
     @staticmethod
     def _clean_sensevoice_text(text: str) -> str:
@@ -121,6 +157,16 @@ class ASREngine:
             self._last_text = ""
             self._is_speaking = False
             self._speech_buffer.clear()
+        # 清空队列中未处理的音频
+        self._audio_queue.clear()
+
+    def stop(self):
+        """停止异步识别线程"""
+        self._running = False
+        self._queue_event.set()  # 唤醒线程以便退出
+        if self._worker_thread:
+            self._worker_thread.join(timeout=3)
+            self._worker_thread = None
 
     def get_current_text(self) -> str:
         return self._last_text

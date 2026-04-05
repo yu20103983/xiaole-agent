@@ -10,8 +10,7 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 sys.path.insert(0, os.path.dirname(__file__))
 
 import sounddevice as sd
-from scipy.signal import resample as scipy_resample
-from audio_io import AudioRecorder, auto_detect_devices, check_duplex_support
+from audio_io import AudioRecorder, auto_detect_devices, check_duplex_support, fast_resample
 from asr_engine import ASREngine
 from tts_engine import TTSEngine
 from pi_client import PiClient
@@ -99,7 +98,7 @@ def clean_for_speech(text):
 
 def resample_to_a2dp(audio_float32):
     """24kHz float32 → A2DP采样率 float32"""
-    return scipy_resample(audio_float32, int(len(audio_float32) * A2DP_SR / 24000)).astype(np.float32)
+    return fast_resample(audio_float32, 24000, A2DP_SR)
 
 
 def play_audio(audio_float32, first=False):
@@ -560,6 +559,7 @@ def main():
         pass
 
     recorder.stop()
+    asr.stop()
     pi.stop()
     print("语音助手已关闭")
 
