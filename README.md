@@ -30,6 +30,8 @@
 
 ## 📦 安装
 
+> ✨ 想快速上手？看 [QUICK_START.md](QUICK_START.md)
+
 ### 前置条件
 
 - Python 3.10+
