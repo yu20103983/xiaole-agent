@@ -1,14 +1,13 @@
 {
-  "name": "voice_agent",
+  "name": "xiaole-voice-agent",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "小乐 - 基于唤醒词的中文语音 AI 助手",
+  "private": true,
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "set PYTHONIOENCODING=utf-8 && python -X utf8 src/main.py"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": ["voice-assistant", "chinese", "asr", "tts", "pi-agent"],
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "@mariozechner/pi-coding-agent": "^0.65.0"

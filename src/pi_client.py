@@ -211,7 +211,7 @@ class PiClient:
 
 if __name__ == "__main__":
     print("=== Pi RPC 客户端测试 ===")
-    client = PiClient(working_dir="D:/workdir/voice_agent")
+    client = PiClient(working_dir=".")
 
     def on_delta(delta):
         print(delta, end="", flush=True)

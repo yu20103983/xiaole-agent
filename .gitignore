@@ -1,9 +1,48 @@
+# Byte-compiled
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+
+# Node
 node_modules/
+package-lock.json
+
+# Models (too large for git)
+models/
+
+# Binary tools
+bin/
+
+# Cache
+cache/
+
+# Audio files
 *.wav
 *.mp3
-models/
-bin/
+*.m4a
+*.ogg
+*.flac
+
+# Environment
 .env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Pi Agent runtime data
+.pi/skills/music_cache/
+
+# Temp
+*.tmp
+*.log

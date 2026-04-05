@@ -1,8 +1,7 @@
 """
-蓝牙语音 Pi Agent - v3
-1. 打断词"停止"
-2. agent执行前先汇报,回复简短
-3. 长输入:积累多句后再送agent;"小派我要长段输入"→等"好了"
+小乐语音助手 - 主程序
+
+功能：语音唯醒、指令识别、Agent 交互、流式 TTS 播报、语音打断
 """
 import sys, os, time, signal, threading, re, queue
 import numpy as np
