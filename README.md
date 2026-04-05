@@ -42,7 +42,7 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/<your-username>/xiaole-agent.git
+git clone https://github.com/yu20103983/xiaole-agent.git
 cd xiaole-agent
 ```
 
