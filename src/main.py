@@ -16,10 +16,7 @@ from asr_engine import ASREngine
 from tts_engine import TTSEngine
 from pi_client import PiClient
 from session_controller import SessionController, SessionState
-
-# ============ 设备配置 ============
-A2DP_ID = 11; A2DP_SR = 44100
-HFP_IN = 9; HFP_IN_SR = 44100
+from config import *
 
 SYSTEM_PROMPT = """你是"小乐"，通过蓝牙耳机与用户语音对话的个人助理。
 
@@ -52,8 +49,13 @@ def clean_for_speech(text):
     return text.strip()
 
 
+def resample_to_a2dp(audio_float32):
+    """24kHz float32 → A2DP采样率 float32"""
+    return scipy_resample(audio_float32, int(len(audio_float32) * A2DP_SR / 24000)).astype(np.float32)
+
+
 def play_audio(audio_float32, first=False):
-    out = scipy_resample(audio_float32, int(len(audio_float32) * A2DP_SR / 24000)).astype(np.float32)
+    out = resample_to_a2dp(audio_float32)
     if first:
         out = np.concatenate([np.zeros(int(A2DP_SR * 0.5), dtype=np.float32), out])
     sd.play(out, samplerate=A2DP_SR, device=A2DP_ID)
@@ -62,8 +64,8 @@ def play_audio(audio_float32, first=False):
 
 # ============ 全局组件 ============
 asr = ASREngine()
-tts = TTSEngine(voice="xiaoxiao", rate="+10%")
-pi = PiClient(working_dir="D:/workdir/voice_agent")
+tts = TTSEngine(voice=TTS_VOICE, rate=TTS_RATE)
+pi = PiClient(working_dir=PI_WORKING_DIR, provider=PI_PROVIDER, model=PI_MODEL)
 session = SessionController()
 recorder = AudioRecorder(device_id=HFP_IN, sample_rate=HFP_IN_SR, target_sr=16000,
                          block_size=HFP_IN_SR // 10)
@@ -73,7 +75,6 @@ processing = False
 long_input_mode = False      # 长输入模式
 input_buffer = []            # 输入积累缓冲
 input_timer = None           # 静音超时定时器
-INPUT_SILENCE_TIMEOUT = 3.0  # 普通模式：3秒无新输入→发送
 
 
 def feed_audio(data):
@@ -137,64 +138,148 @@ def handle_command(cmd):
     # 流式文本收集
     sentence_queue = queue.Queue()
     buf = {"text": "", "done": False}
-    SENT_END = re.compile(r'[。！？!?\n]')
+    # 切句：逗号切短句，句号/问号/叹号切长句
+    CLAUSE_PAT = re.compile(r'[,，;；、]|[。！？!?\n]')
 
     def on_delta(delta):
         print(delta, end="", flush=True)
         buf["text"] += delta
         while True:
-            m = SENT_END.search(buf["text"])
+            m = CLAUSE_PAT.search(buf["text"])
             if not m:
                 break
             pos = m.end()
+            sep_char = m.group()
+            is_sentence_end = sep_char in '。！？!?\n'
             s = clean_for_speech(buf["text"][:pos].strip())
             buf["text"] = buf["text"][pos:]
             if s and len(s) > 1:
-                sentence_queue.put(s)
+                sentence_queue.put((s, is_sentence_end))
 
     def on_complete(full):
         print(flush=True)
         r = clean_for_speech(buf["text"].strip())
         if r and len(r) > 1:
-            sentence_queue.put(r)
+            sentence_queue.put((r, True))
         buf["text"] = ""
         buf["done"] = True
 
     pi.set_callbacks(on_text_delta=on_delta, on_response_complete=on_complete)
     pi.prompt_async(cmd)
 
-    # 逐句播放 + 预合成下一句 + 空闲时监听打断
-    # 所有音频设备操作(recorder/sd)均在主线程，避免蓝牙切换问题
+    # ========== 并发合成 + FIFO播放 ==========
+    #
+    # clauses[i] = {text, is_sent_end, audio, ready(Event)}
+    #   - 每个短句独立合成
+    #
+    # merges[(start, end)] = {text, audio, ready(Event)}
+    #   - 合并文本的 TTS 结果，让 TTS 理解上下文产生连贯语气
+    #   - 最多合4个短句，不跨句号边界
+    #
+    # 播放时：从 play_idx 找最长已就绪的合并音频，没有就用单句
+    #
+    clauses = []          # 有序短句列表
+    merges = {}           # {(start, end): {text, audio, ready}}
+    clauses_lock = threading.Lock()
+    all_text_done = threading.Event()
     aborted = False
     stop_event = threading.Event()
     listening = False
     first_play = True
+    synth_sem = threading.Semaphore(4)  # 最多4个并发合成
 
-    # 预合成：后台线程合成下一句
-    prefetch = {"audio": None, "ready": threading.Event(), "sentence": None}
-
-    def _prefetch_synth(sentence):
-        """后台合成一句"""
-        prefetch["sentence"] = sentence
-        prefetch["audio"] = None
-        prefetch["ready"].clear()
-        def _do():
-            print(f"  [预合成] {sentence[:40]}", flush=True)
-            prefetch["audio"] = tts.synthesize(sentence)
-            prefetch["ready"].set()
-        threading.Thread(target=_do, daemon=True).start()
-
-    def _get_next_sentence(timeout=0.5):
-        """从 sentence_queue 取下一句，返回 (sentence, is_done)"""
+    def _do_synth(item):
+        """合成一个音频项（clause 或 merge）"""
+        synth_sem.acquire()
         try:
-            return sentence_queue.get(timeout=timeout), False
-        except queue.Empty:
-            if buf["done"] and sentence_queue.empty():
-                return None, True
-            return None, False
+            if stop_event.is_set():
+                return
+            item["audio"] = tts.synthesize(item["text"])
+        finally:
+            item["ready"].set()
+            synth_sem.release()
+
+    def _submit_merges_for(new_idx):
+        """新短句到达后，创建以它结尾的合并项（长度2~MAX_MERGE_CLAUSES）"""
+        with clauses_lock:
+            for length in range(2, MAX_MERGE_CLAUSES + 1):
+                start = new_idx - length + 1
+                if start < 0:
+                    continue
+                # 检查中间不跨句号边界：start ~ new_idx-1 都不能是句末
+                can_merge = True
+                for i in range(start, new_idx):
+                    if clauses[i]["is_sent_end"]:
+                        can_merge = False
+                        break
+                if not can_merge:
+                    continue
+                key = (start, new_idx)
+                if key in merges:
+                    continue
+                # 拼接合并文本（用逗号连接）
+                merged_text = "，".join(clauses[i]["text"] for i in range(start, new_idx + 1))
+                merge_item = {"text": merged_text, "audio": None, "ready": threading.Event()}
+                merges[key] = merge_item
+
+            # 复制要合成的项（锁外启动线程）
+            new_merges = {k: v for k, v in merges.items()
+                         if k[1] == new_idx and not v["ready"].is_set()}
+
+        for key, item in new_merges.items():
+            print(f"  [合成{key}] {item['text'][:50]}", flush=True)
+            threading.Thread(target=_do_synth, args=(item,), daemon=True).start()
+
+    def _collector():
+        """收集线程：取短句 → 启动单句合成 + 合并合成"""
+        while not stop_event.is_set():
+            try:
+                text, is_sent_end = sentence_queue.get(timeout=0.3)
+            except queue.Empty:
+                if buf["done"] and sentence_queue.empty():
+                    break
+                continue
+
+            item = {"text": text, "is_sent_end": is_sent_end,
+                    "audio": None, "ready": threading.Event()}
+            with clauses_lock:
+                idx = len(clauses)
+                clauses.append(item)
+
+            print(f"  [#{idx}] {text[:40]}{'。' if is_sent_end else '，'}", flush=True)
+            threading.Thread(target=_do_synth, args=(item,), daemon=True).start()
+            _submit_merges_for(idx)
+
+        all_text_done.set()
+
+    collector_thread = threading.Thread(target=_collector, daemon=True)
+    collector_thread.start()
+
+    # ========== 主线程：FIFO顺序播放 ==========
+    play_idx = 0
+    first_play = True  # 首次播放需要BT切换
+
+    def _find_best_audio():
+        """从 play_idx 开始，找最长的已就绪合并音频。
+        返回 (audio, text, next_play_idx) 或 None"""
+        with clauses_lock:
+            n = len(clauses)
+        if play_idx >= n:
+            return None
+        for length in range(min(MAX_MERGE_CLAUSES, n - play_idx), 1, -1):
+            end = play_idx + length - 1
+            key = (play_idx, end)
+            if key in merges:
+                m = merges[key]
+                if m["ready"].is_set() and m["audio"] is not None:
+                    return (m["audio"], m["text"], end + 1)
+        with clauses_lock:
+            c = clauses[play_idx]
+        if c["ready"].is_set() and c["audio"] is not None:
+            return (c["audio"], c["text"], play_idx + 1)
+        return None
 
     while True:
-        # 检查打断
         if stop_event.is_set():
             print("\n[打断] 用户说停止", flush=True)
             if listening:
@@ -210,59 +295,71 @@ def handle_command(cmd):
             play_simple("好的，已停止")
             break
 
-        # 取句子
-        sentence, is_done = _get_next_sentence()
-        if is_done:
-            break
-        if sentence is None:
-            # 空闲期 → 开始监听打断
+        with clauses_lock:
+            has_more = play_idx < len(clauses)
+
+        if not has_more:
+            if all_text_done.is_set():
+                break
             if not listening:
                 start_interrupt_listen(stop_event)
                 listening = True
+            time.sleep(0.2)
             continue
 
-        # 有句子要播放 → 主线程停监听 + BT切换
+        # 找最佳音频
+        best = _find_best_audio()
+        if best is None:
+            with clauses_lock:
+                c = clauses[play_idx]
+            if not c["ready"].wait(timeout=0.3):
+                continue
+            best = _find_best_audio()
+            if best is None:
+                play_idx += 1
+                continue
+
+        audio, text, next_idx = best
+        span = next_idx - play_idx
+
+        # 单句就绪但合并项正在合成 → 短等给合并机会（首句不等）
+        if span == 1 and not first_play:
+            pending_keys = [k for k in merges if k[0] == play_idx and not merges[k]["ready"].is_set()]
+            if pending_keys:
+                for mk in pending_keys:
+                    merges[mk]["ready"].wait(timeout=0.5)
+                better = _find_best_audio()
+                if better is not None:
+                    audio, text, next_idx = better
+                    span = next_idx - play_idx
+
+        # HFP→A2DP 切换（仅在监听后）
         if listening:
             stop_interrupt_listen()
             listening = False
             sd.stop()
-            time.sleep(0.5)  # 等 BT 切回 A2DP
+            time.sleep(0.5)
+            first_play = True  # 切换后需要重新加静音前缀
 
         if stop_event.is_set():
             continue
 
-        # 合成当前句（或用预合成结果）
-        audio = None
-        if prefetch["ready"].is_set() and prefetch["sentence"] == sentence:
-            audio = prefetch["audio"]
-            print(f"  [命中预合成]", flush=True)
-        if audio is None:
-            print(f"  [合成] {sentence[:40]}", flush=True)
-            audio = tts.synthesize(sentence)
-
-        if audio is None:
-            continue
-
-        # 播放前启动下一句的预合成
-        next_s, _ = _get_next_sentence(timeout=0.05)
-        if next_s:
-            _prefetch_synth(next_s)
-
-        # 播放（仅第一句或 HFP切换后加静音前缀）
-        use_prefix = first_play
+        # 首次播放：加静音前缀让蓝牙就绪
         if first_play:
             sd.stop()
             time.sleep(0.3)
-        print(f"  [播放] {sentence[:40]}", flush=True)
-        play_audio(audio, first=use_prefix)
-        first_play = False
 
-        # 播放完毕，如果预合成的下一句已就绪，下次循环立即取用
+        tag = f"x{span}" if span > 1 else ""
+        print(f"  [播放{tag}] {text[:60]}", flush=True)
+        play_audio(audio, first=first_play)
+        first_play = False
+        play_idx = next_idx
+
+    collector_thread.join(timeout=5)
 
     if not aborted:
         pi._response_event.wait(timeout=10)
 
-    # 确保停止监听
     if listening:
         stop_interrupt_listen()
 

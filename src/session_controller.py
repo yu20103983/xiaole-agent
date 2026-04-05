@@ -12,6 +12,7 @@ import time
 import threading
 from enum import Enum
 from typing import Optional, Callable
+from config import AUTO_SLEEP_TIMEOUT
 
 
 class SessionState(Enum):
@@ -91,7 +92,7 @@ class SessionController:
         self._on_command: Optional[Callable[[str], None]] = None
         self._lock = threading.Lock()
         self._last_activity = time.time()
-        self._auto_sleep_timeout = 120  # 2分钟无活动自动休眠
+        self._auto_sleep_timeout = AUTO_SLEEP_TIMEOUT
         # 上下文关联：用户说了"小乐"但没跟指令，等待下一句
         self._pending_command = False
         self._pending_time = 0.0
