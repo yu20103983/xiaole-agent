@@ -437,6 +437,14 @@ def handle_command(cmd):
     asr.reset()
     if not is_duplex:
         recorder.start(callback=feed_audio)
+
+    # 检查是否有排队的指令
+    queued = session.pop_queued_command()
+    if queued:
+        print(f"\n[排队指令] 执行: {queued}", flush=True)
+        on_command(queued)
+        return
+
     print(flush=True)
 
 

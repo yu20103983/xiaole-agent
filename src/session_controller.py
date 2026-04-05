@@ -111,6 +111,8 @@ class SessionController:
         # 上下文关联：用户说了"小乐"但没跟指令，等待下一句
         self._pending_command = False
         self._pending_time = 0.0
+        # 排队指令：agent处理中时用户说的新指令
+        self._queued_command: Optional[str] = None
 
     def set_callbacks(self,
                       on_wake: Optional[Callable[[], None]] = None,
@@ -133,7 +135,10 @@ class SessionController:
             elif self.state == SessionState.ACTIVE:
                 if is_final:
                     self._handle_active(text)
-            # PROCESSING 和 SPEAKING 状态下忽略输入
+            elif self.state == SessionState.PROCESSING:
+                if is_final:
+                    self._handle_processing(text)
+            # SPEAKING 状态下忽略输入
 
     def _handle_sleeping(self, text: str):
         """休眠状态：检测唤醒词
@@ -232,6 +237,43 @@ class SessionController:
                 print(f"[Session] 等待超时，忽略 ({text})")
 
         # 5. 不含"小乐"且非pending → 忽略（环境噪音）
+
+    def _handle_processing(self, text: str):
+        """处理中状态：缓存用户新指令，等agent完成后执行"""
+        # 检测休眠词
+        if _is_sleep_command(text):
+            self._queued_command = None
+            self._transition(SessionState.SLEEPING)
+            print(f"[Session] 处理中收到休眠指令 ({text})")
+            if self._on_sleep:
+                self._on_sleep()
+            return
+
+        # 尝试提取指令
+        command = self._try_extract_command(text)
+        if command:
+            self._queued_command = command
+            print(f"[Session] ▇ 排队指令(等待agent完成): {command}")
+            return
+
+        # "乐"前缀截断
+        le_prefix = re.match(_LE_CHARS + r"[,，:：。.\s]*", text)
+        if le_prefix:
+            cmd = text[le_prefix.end():].strip()
+            cmd = re.sub(r'[。．.\uff01!？?]+$', '', cmd).strip()
+            if cmd and len(cmd) > 1:
+                self._queued_command = cmd
+                print(f"[Session] ▇ 排队指令(乐前缀,等待agent完成): {cmd}")
+                return
+
+        # 其他文本忽略（环境噪音/agent回复被麦克风捕获）
+
+    def pop_queued_command(self) -> Optional[str]:
+        """取出并清除排队的指令"""
+        with self._lock:
+            cmd = self._queued_command
+            self._queued_command = None
+            return cmd
 
     def _try_extract_command(self, text: str) -> Optional[str]:
         """从文本中提取指令内容

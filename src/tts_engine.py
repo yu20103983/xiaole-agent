@@ -33,6 +33,9 @@ class TTSEngine:
         "好的，我来帮你", "好的，马上",
     ]
 
+    # 磁盘缓存目录
+    CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cache", "tts")
+
     def __init__(self, voice: str = "xiaoxiao", rate: str = "+0%", volume: str = "+0%"):
         self.voice = self.VOICES.get(voice, voice)
         self.rate = rate
@@ -42,6 +45,8 @@ class TTSEngine:
         self._cache: dict[str, Optional[np.ndarray]] = {}  # TTS音频缓存
         self._cache_lock = threading.Lock()
         self._init_event_loop()
+        # 确保磁盘缓存目录存在
+        os.makedirs(self.CACHE_DIR, exist_ok=True)
 
     def _init_event_loop(self):
         """初始化独立的事件循环线程"""
@@ -63,23 +68,71 @@ class TTSEngine:
                 audio_bytes += chunk["data"]
         return audio_bytes
 
+    def _cache_file_path(self, text: str) -> str:
+        """根据文本+语音+语速生成磁盘缓存文件路径"""
+        import hashlib
+        key = f"{self.voice}_{self.rate}_{self.volume}_{text}"
+        h = hashlib.md5(key.encode('utf-8')).hexdigest()
+        return os.path.join(self.CACHE_DIR, f"{h}.npy")
+
+    def _load_from_disk(self, text: str) -> Optional[np.ndarray]:
+        """从磁盘加载缓存音频"""
+        path = self._cache_file_path(text)
+        if os.path.exists(path):
+            try:
+                return np.load(path)
+            except Exception:
+                pass
+        return None
+
+    def _save_to_disk(self, text: str, audio: np.ndarray):
+        """保存音频到磁盘缓存"""
+        try:
+            path = self._cache_file_path(text)
+            np.save(path, audio)
+        except Exception as e:
+            print(f"[TTS] 磁盘缓存写入失败: {e}")
+
     def precache(self, phrases: list[str] = None):
-        """预缓存常用短语的TTS音频（后台线程并发合成）"""
+        """预缓存常用短语的TTS音频，优先从磁盘加载，未命中再合成并存盘"""
         phrases = phrases or self.PRECACHE_PHRASES
         print(f"[TTS] 预缓存 {len(phrases)} 个常用短语...")
+
+        # 先从磁盘加载
+        need_synth = []
+        disk_loaded = 0
+        for phrase in phrases:
+            audio = self._load_from_disk(phrase)
+            if audio is not None:
+                with self._cache_lock:
+                    self._cache[phrase] = audio
+                disk_loaded += 1
+            else:
+                need_synth.append(phrase)
+
+        if disk_loaded > 0:
+            print(f"[TTS] 从磁盘加载 {disk_loaded} 个")
+
+        if not need_synth:
+            print(f"[TTS] 预缓存完成: {disk_loaded}/{len(phrases)} 个(全部命中磁盘)")
+            return
+
+        print(f"[TTS] 需合成 {len(need_synth)} 个...")
 
         def _cache_one(phrase):
             try:
                 mp3_data = self._run_async(self._synthesize_to_bytes(phrase))
                 if mp3_data:
                     audio = self._decode_mp3(mp3_data)
-                    with self._cache_lock:
-                        self._cache[phrase] = audio
+                    if audio is not None:
+                        with self._cache_lock:
+                            self._cache[phrase] = audio
+                        self._save_to_disk(phrase, audio)
             except Exception as e:
                 print(f"[TTS] 预缓存失败 '{phrase}': {e}")
 
         threads = []
-        for phrase in phrases:
+        for phrase in need_synth:
             t = threading.Thread(target=_cache_one, args=(phrase,), daemon=True)
             t.start()
             threads.append(t)
