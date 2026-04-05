@@ -1,5 +1,5 @@
 """
-模块B2: ASR 引擎 — VAD + SenseVoice 离线识别
+ASR 引擎 — VAD + SenseVoice 离线识别
 用 silero-VAD 检测语音段，用 SenseVoice 做离线识别
 比流式 zipformer 准确率高很多
 """

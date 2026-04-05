@@ -10,7 +10,7 @@
 ## 2. 一键安装
 
 ```bash
-git clone https://github.com/yourname/voice-agent.git
+git clone https://github.com/<your-username>/voice-agent.git
 cd voice-agent
 setup.bat
 ```
@@ -26,7 +26,7 @@ PI_PROVIDER = "claude-proxy"      # 改成你的 provider
 PI_MODEL = "claude-opus-4-6"      # 改成你的模型
 ```
 
-> 详见 [Pi Agent 文档](https://github.com/nicejmp1/pi-coding-agent) 了解可用的 provider 配置
+> 详见 [Pi Agent 文档](https://github.com/mariozechner/pi-coding-agent) 了解可用的 provider 配置
 
 ## 4. 启动
 

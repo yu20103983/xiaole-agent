@@ -1,5 +1,5 @@
 """
-模块D: Pi Agent RPC 客户端
+Pi Agent RPC 客户端
 通过 stdin/stdout JSON 协议与 pi --mode rpc 通信
 """
 

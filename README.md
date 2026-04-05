@@ -1,6 +1,6 @@
 # 小乐 - 语音 AI 助手
 
-基于唤醒词的中文语音 AI 助手，通过麦克风和扬声器（或蓝牙耳机）与 [Pi Coding Agent](https://github.com/nicejmp1/pi-coding-agent) 进行自然语音交互。支持语音唤醒、语音指令、流式 TTS 播报、语音打断等。
+基于唤醒词的中文语音 AI 助手，通过麦克风和扬声器（或蓝牙耳机）与 [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent) 进行自然语音交互。支持语音唤醒、语音指令、流式 TTS 播报、语音打断等。
 
 ## ✨ 特性
 
@@ -42,7 +42,7 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/yourname/voice-agent.git
+git clone https://github.com/<your-username>/voice-agent.git
 cd voice-agent
 ```
 
@@ -77,7 +77,7 @@ mkdir models
 
 ### 5. 配置 AI Provider
 
-在项目根目录创建 Pi Agent 配置（详见 [Pi 文档](https://github.com/nicejmp1/pi-coding-agent)）：
+在项目根目录创建 Pi Agent 配置（详见 [Pi 文档](https://github.com/mariozechner/pi-coding-agent)）：
 
 ```bash
 # 编辑 src/config.py 中的 PI_PROVIDER 和 PI_MODEL

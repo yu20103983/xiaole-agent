@@ -1,5 +1,5 @@
 """
-模块C: TTS 引擎 — edge-tts 文本转语音 + 音频解码播放
+TTS 引擎 — edge-tts 文本转语音 + 音频解码 + 磁盘缓存
 """
 
 import asyncio

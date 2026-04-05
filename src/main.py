@@ -530,7 +530,7 @@ def main():
 
     duplex_str = "全双工(边说边听)" if is_duplex else "半双工(交替模式)"
     print("=" * 50)
-    print("  🎧 蓝牙语音 Pi Agent v4")
+    print("  🎧 小乐语音助手")
     print(f"  音频模式: {duplex_str}")
     print("  '小乐小乐' 唤醒 | '小乐小乐退下' 休眠")
     print("  '小乐,xxx' 发送指令(等静音后发送)")
