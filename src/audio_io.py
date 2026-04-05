@@ -367,6 +367,89 @@ class AudioPlayer:
         return self._playing
 
 
+def check_duplex_support(input_id: int, input_sr: int, output_id: int, output_sr: int,
+                         test_duration: float = 1.0) -> dict:
+    """检测音频设备是否支持同时输入和输出（全双工）
+
+    实际尝试同时打开输入流和输出流，播放静音同时录音。
+    如果能同时工作不报错，就是全双工（duplex）模式；否则半双工。
+
+    返回 dict:
+      duplex: bool — 是否支持全双工
+      reason: str — 检测结果说明
+    """
+    import time as _time
+
+    result = {"duplex": False, "reason": ""}
+
+    # 实际测试：同时打开输入流和输出流
+    input_ok = False
+    output_ok = False
+    error_msg = ""
+
+    try:
+        # 先开输出流（播放静音）
+        out_stream = sd.OutputStream(
+            device=output_id,
+            samplerate=output_sr,
+            channels=1,
+            dtype='float32'
+        )
+        out_stream.start()
+        silence = np.zeros(int(output_sr * 0.1), dtype=np.float32)
+        out_stream.write(silence)
+        output_ok = True
+
+        # 再开输入流（录音）
+        recorded = []
+        def _cb(indata, frames, time_info, status):
+            recorded.append(indata[:, 0].copy())
+
+        in_stream = sd.InputStream(
+            device=input_id,
+            samplerate=input_sr,
+            channels=1,
+            dtype='float32',
+            callback=_cb
+        )
+        in_stream.start()
+        input_ok = True
+
+        # 同时运行一段时间
+        _time.sleep(test_duration)
+
+        # 检查是否都还在运行
+        if in_stream.active and out_stream.active and len(recorded) > 0:
+            result["duplex"] = True
+            result["reason"] = f"设备支持全双工，录到 {len(recorded)} 块音频"
+        else:
+            result["reason"] = f"流状态异常: in={in_stream.active} out={out_stream.active} blocks={len(recorded)}"
+
+        in_stream.stop()
+        in_stream.close()
+        out_stream.stop()
+        out_stream.close()
+
+    except Exception as e:
+        error_msg = str(e)
+        result["reason"] = f"全双工测试失败: {error_msg}"
+        # 清理
+        try:
+            if input_ok:
+                in_stream.stop()
+                in_stream.close()
+        except:
+            pass
+        try:
+            if output_ok:
+                out_stream.stop()
+                out_stream.close()
+        except:
+            pass
+
+    return result
+
+
 if __name__ == "__main__":
     print("=== 蓝牙音频设备检测 ===")
     list_devices()

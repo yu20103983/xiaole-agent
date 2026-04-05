@@ -24,12 +24,23 @@ class TTSEngine:
         "yunjian": "zh-CN-YunjianNeural",       # 男声，沉稳
     }
 
+    # 常用短语预缓存列表
+    PRECACHE_PHRASES = [
+        "好的", "我在", "好的，我来查一下", "好的，我来处理一下",
+        "好的，稍等", "好的，已停止", "我在，请说",
+        "语音助手已启动，说小乐小乐唤醒我",
+        "好的，再见", "好的，我来看看", "嗯", "好",
+        "好的，我来帮你", "好的，马上",
+    ]
+
     def __init__(self, voice: str = "xiaoxiao", rate: str = "+0%", volume: str = "+0%"):
         self.voice = self.VOICES.get(voice, voice)
         self.rate = rate
         self.volume = volume
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
+        self._cache: dict[str, Optional[np.ndarray]] = {}  # TTS音频缓存
+        self._cache_lock = threading.Lock()
         self._init_event_loop()
 
     def _init_event_loop(self):
@@ -52,8 +63,45 @@ class TTSEngine:
                 audio_bytes += chunk["data"]
         return audio_bytes
 
+    def precache(self, phrases: list[str] = None):
+        """预缓存常用短语的TTS音频（后台线程并发合成）"""
+        phrases = phrases or self.PRECACHE_PHRASES
+        print(f"[TTS] 预缓存 {len(phrases)} 个常用短语...")
+
+        def _cache_one(phrase):
+            try:
+                mp3_data = self._run_async(self._synthesize_to_bytes(phrase))
+                if mp3_data:
+                    audio = self._decode_mp3(mp3_data)
+                    with self._cache_lock:
+                        self._cache[phrase] = audio
+            except Exception as e:
+                print(f"[TTS] 预缓存失败 '{phrase}': {e}")
+
+        threads = []
+        for phrase in phrases:
+            t = threading.Thread(target=_cache_one, args=(phrase,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=15)
+
+        with self._cache_lock:
+            cached = len([v for v in self._cache.values() if v is not None])
+        print(f"[TTS] 预缓存完成: {cached}/{len(phrases)} 个")
+
+    def get_cached(self, text: str) -> Optional[np.ndarray]:
+        """查找缓存，命中返回音频，未命中返回None"""
+        with self._cache_lock:
+            return self._cache.get(text)
+
     def synthesize(self, text: str, retries: int = 3) -> Optional[np.ndarray]:
-        """合成语音，返回 numpy 音频数组 (float32, 24kHz)，失败自动重试"""
+        """合成语音，返回 numpy 音频数组 (float32, 24kHz)，优先用缓存，失败自动重试"""
+        # 先查缓存
+        cached = self.get_cached(text)
+        if cached is not None:
+            return cached.copy()
+
         import time as _time
         for attempt in range(retries):
             try:

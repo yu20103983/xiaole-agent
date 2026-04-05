@@ -11,12 +11,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import sounddevice as sd
 from scipy.signal import resample as scipy_resample
-from audio_io import AudioRecorder, auto_detect_devices
+from audio_io import AudioRecorder, auto_detect_devices, check_duplex_support
 from asr_engine import ASREngine
 from tts_engine import TTSEngine
 from pi_client import PiClient
 from session_controller import SessionController, SessionState
 from config import *
+
+# 全局双工模式标志,启动时检测设置
+is_duplex = False
 
 # ============ 设备自动检测 ============
 def _init_audio_devices():
@@ -26,6 +29,7 @@ def _init_audio_devices():
         print(f"[Audio] 使用配置: 输入=#{HFP_IN}({HFP_IN_SR}Hz) 输出=#{A2DP_ID}({A2DP_SR}Hz)")
         return
     det = auto_detect_devices()
+    _init_audio_devices._det = det  # 保存检测结果供双工检测用
     if HFP_IN is None:
         HFP_IN = det['input_id']
         HFP_IN_SR = det['input_sr']
@@ -35,30 +39,53 @@ def _init_audio_devices():
 
 _init_audio_devices()
 
-SYSTEM_PROMPT = """你是“小乐”，通过耳机与用户语音对话的个人助理。
+# ============ 设备双工检测 ============
+def _check_duplex():
+    """ 检测设备是否支持同时输入输出,设置全局 is_duplex 标志 """
+    global is_duplex
+    if DUPLEX_MODE is not None:
+        is_duplex = DUPLEX_MODE
+        mode_str = "全双工(边说边听)" if is_duplex else "半双工(交替模式)"
+        print(f"[Audio] 双工模式(配置指定): {mode_str}")
+        return
+
+    print("[Audio] 正在检测设备双工能力...")
+    # 蓝牙一体设备 (HFP输入+A2DP输出) 在 Windows 下不支持全双工
+    if hasattr(_init_audio_devices, '_det') and _init_audio_devices._det.get('mode') == 'bt_unified':
+        is_duplex = False
+        print(f"[Audio] 检测结果: 半双工(交替模式) - 蓝牙一体设备 HFP/A2DP 不可同时工作")
+        return
+    result = check_duplex_support(HFP_IN, HFP_IN_SR, A2DP_ID, A2DP_SR, test_duration=1.0)
+    is_duplex = result["duplex"]
+    mode_str = "全双工(边说边听)" if is_duplex else "半双工(交替模式)"
+    print(f"[Audio] 检测结果: {mode_str} - {result['reason']}")
+
+_check_duplex()
+
+SYSTEM_PROMPT = """你是"小乐",通过耳机与用户语音对话的个人助理。
 
 ★★★ 最重要的规则 ★★★
-你的回复会被 TTS 实时播报，用户在等你说话。
-所以你必须：先说一句话（如“好的，我来查一下”），然后再执行工具/命令。
-绝对禁止先执行工具再说话，否则用户会长时间听不到任何声音。
+你的回复会被 TTS 实时播报,用户在等你说话。
+所以你必须:先说一句话(如"好的,我来查一下"),然后再执行工具/命令。
+绝对禁止先执行工具再说话,否则用户会长时间听不到任何声音。
 
-核心能力：
-1. 完整的系统操作能力：执行任意命令行、读写文件、安装软件、管理进程
-2. 联网能力：用 curl/wget 搜索、下载、访问 API、爬取网页
-3. 编程能力：Python/Node/PowerShell等
-4. 遇到不会的事，主动搜索解决方案
+核心能力:
+1. 完整的系统操作能力:执行任意命令行、读写文件、安装软件、管理进程
+2. 联网能力:用 curl/wget 搜索、下载、访问 API、爬取网页
+3. 编程能力:Python/Node/PowerShell等
+4. 遇到不会的事,主动搜索解决方案
 
-回复规则（回复会被 TTS 播放）：
-1. 简洁口语化，禁止 markdown、表格、代码块、emoji、特殊符号
-2. 一般回复 2-3 句话，列举不超过3条
-3. 执行完只说结果，不重复过程
+回复规则(回复会被 TTS 播放):
+1. 简洁口语化,禁止 markdown、表格、代码块、emoji、特殊符号
+2. 一般回复 2-3 句话,列举不超过3条
+3. 执行完只说结果,不重复过程
 
-行动原则：
-- 用户让你做什么就做什么，不要反问“你确定吗”
-- 缺少工具就安装，缺少文件就下载，主动解决问题
+行动原则:
+- 用户让你做什么就做什么,不要反问"你确定吗"
+- 缺少工具就安装,缺少文件就下载,主动解决问题
 - 播放音乐可以用 PowerShell 调用系统播放器或下载音乐文件后播放
 - 查询信息可以用 curl 访问搜索引擎或 API
-- 充分发挥你的编程和系统操作能力，做一个真正有用的助手"""
+- 充分发挥你的编程和系统操作能力,做一个真正有用的助手"""
 
 
 def clean_for_speech(text):
@@ -78,7 +105,7 @@ def resample_to_a2dp(audio_float32):
 def play_audio(audio_float32, first=False):
     out = resample_to_a2dp(audio_float32)
     if first:
-        out = np.concatenate([np.zeros(int(A2DP_SR * 0.5), dtype=np.float32), out])
+        out = np.concatenate([np.zeros(int(A2DP_SR * 0.25), dtype=np.float32), out])
     sd.play(out, samplerate=A2DP_SR, device=A2DP_ID)
     sd.wait()
 
@@ -103,9 +130,10 @@ def feed_audio(data):
 
 
 def play_simple(text):
-    recorder.stop()
+    if not is_duplex:
+        recorder.stop()
     sd.stop()  # 确保之前的播放已停止
-    time.sleep(0.3)
+    time.sleep(0.15)
     print(f"[TTS] {text}", flush=True)
     audio = tts.synthesize(text)
     if audio is not None:
@@ -114,9 +142,10 @@ def play_simple(text):
         print(f"  [TTS] 播放完成", flush=True)
     else:
         print(f"  [TTS] 合成失败!", flush=True)
-    time.sleep(0.2)
+    time.sleep(0.1)
     asr.reset()
-    recorder.start(callback=feed_audio)
+    if not is_duplex:
+        recorder.start(callback=feed_audio)
 
 
 def speak_async(text, then_state=None):
@@ -138,12 +167,18 @@ def start_interrupt_listen(stop_event):
             stop_event.set()
 
     asr.set_callbacks(on_final=_on_final)
-    asr.reset()
-    recorder.start(callback=feed_audio)
+    if is_duplex:
+        # 全双工模式:录音一直在跑,只需重置ASR
+        asr.reset()
+    else:
+        # 半双工模式:需要重新启动录音
+        asr.reset()
+        recorder.start(callback=feed_audio)
 
 def stop_interrupt_listen():
     """停止监听"""
-    recorder.stop()
+    if not is_duplex:
+        recorder.stop()
     time.sleep(0.05)
 
 
@@ -153,7 +188,12 @@ def handle_command(cmd):
     processing = True
     print(f"\n[→ Pi] {cmd}", flush=True)
 
-    recorder.stop()
+    if is_duplex:
+        # 全双工模式:录音不停,直接设置打断监听
+        asr.reset()
+    else:
+        # 半双工模式:停止录音
+        recorder.stop()
     time.sleep(0.1)
 
     # 流式文本收集
@@ -208,6 +248,11 @@ def handle_command(cmd):
     listening = False
     first_play = True
     synth_sem = threading.Semaphore(4)  # 最多4个并发合成
+
+    # 全双工模式:录音一直在跑,直接启动打断监听
+    if is_duplex:
+        start_interrupt_listen(stop_event)
+        listening = True
 
     def _do_synth(item):
         """合成一个音频项(clause 或 merge)"""
@@ -322,7 +367,7 @@ def handle_command(cmd):
         if not has_more:
             if all_text_done.is_set():
                 break
-            if not listening:
+            if not listening and not is_duplex:
                 start_interrupt_listen(stop_event)
                 listening = True
             time.sleep(0.2)
@@ -343,23 +388,24 @@ def handle_command(cmd):
         audio, text, next_idx = best
         span = next_idx - play_idx
 
-        # 单句就绪但合并项正在合成 → 短等给合并机会(首句不等)
-        if span == 1 and not first_play:
+        # 单句就绪但合并项正在合成 → 短等给合并机会
+        # 首2句不等合并,直接播放,减少首次响应延迟
+        if span == 1 and play_idx >= 2:
             pending_keys = [k for k in merges if k[0] == play_idx and not merges[k]["ready"].is_set()]
             if pending_keys:
                 for mk in pending_keys:
-                    merges[mk]["ready"].wait(timeout=0.5)
+                    merges[mk]["ready"].wait(timeout=0.3)
                 better = _find_best_audio()
                 if better is not None:
                     audio, text, next_idx = better
                     span = next_idx - play_idx
 
-        # HFP→A2DP 切换(仅在监听后)
-        if listening:
+        # HFP→A2DP 切换(仅在半双工监听后需要)
+        if listening and not is_duplex:
             stop_interrupt_listen()
             listening = False
             sd.stop()
-            time.sleep(0.5)
+            time.sleep(0.25)
             first_play = True  # 切换后需要重新加静音前缀
 
         if stop_event.is_set():
@@ -368,7 +414,7 @@ def handle_command(cmd):
         # 首次播放:加静音前缀让蓝牙就绪
         if first_play:
             sd.stop()
-            time.sleep(0.3)
+            time.sleep(0.15)
 
         tag = f"x{span}" if span > 1 else ""
         print(f"  [播放{tag}] {text[:60]}", flush=True)
@@ -389,7 +435,8 @@ def handle_command(cmd):
     # 恢复正常 ASR 回调(打断监听期间会被替换)
     asr.set_callbacks(on_final=on_asr_final)
     asr.reset()
-    recorder.start(callback=feed_audio)
+    if not is_duplex:
+        recorder.start(callback=feed_audio)
     print(flush=True)
 
 
@@ -443,16 +490,20 @@ def on_command(cmd):
 
     if long_input_mode:
         # 长输入模式:检测"好了"结束
-        if re.search(r'^好了[。..!!]?$', cmd.strip()):
+        if re.search(r'^好了[。..！!]?$', cmd.strip()):
             flush_input_buffer()
         else:
             input_buffer.append(cmd)
             print(f"  [积累] {cmd} (共{len(input_buffer)}段)", flush=True)
         return
 
-    # 普通模式:积累输入,等静音超时后发送
+    # 普通模式:检测"好了"作为结束标记，或等静音超时
+    if re.search(r'^好了[。..！!]?$', cmd.strip()):
+        if input_buffer:
+            flush_input_buffer()
+        return
     input_buffer.append(cmd)
-    print(f"  [积累] {cmd} (等{INPUT_SILENCE_TIMEOUT}s静音)", flush=True)
+    print(f"  [积累] {cmd} (说'好了'或等{INPUT_SILENCE_TIMEOUT}s静音)", flush=True)
     reset_input_timer()
 
 session.set_callbacks(on_wake=on_wake, on_sleep=on_sleep, on_command=on_command)
@@ -470,8 +521,10 @@ asr.set_callbacks(on_final=on_asr_final)
 def main():
     global running
 
+    duplex_str = "全双工(边说边听)" if is_duplex else "半双工(交替模式)"
     print("=" * 50)
     print("  🎧 蓝牙语音 Pi Agent v4")
+    print(f"  音频模式: {duplex_str}")
     print("  '小乐小乐' 唤醒 | '小乐小乐退下' 休眠")
     print("  '小乐,xxx' 发送指令(等静音后发送)")
     print("  '小乐,长段输入' → 说完后说'好了'")
@@ -481,6 +534,8 @@ def main():
 
     print("\n[Init] ASR...", flush=True)
     asr.init()
+    print("[Init] TTS 预缓存...", flush=True)
+    tts.precache()
     print("[Init] Pi Agent...", flush=True)
     pi.start()
     print("[Init] 系统提示词...", flush=True)
